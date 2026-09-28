@@ -20,13 +20,20 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ github.sha }}
+          restore-keys: ccache-
+
       - name: Build con ESP-IDF v6.0.1
         uses: espressif/esp-idf-ci-action@v1
         with:
           esp_idf_version: v6.0.1
           target: esp32s3
           path: '.'
-          command: idf.py build
+          command: export CCACHE_DIR=$PWD/.ccache && idf.py --ccache build
 
       - name: Upload bootloader
         uses: actions/upload-artifact@v4

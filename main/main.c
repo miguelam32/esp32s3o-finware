@@ -257,8 +257,55 @@ static void udp_server_task(void *pvParameters)
 
 /* --------------------------------- main --------------------------------- */
 
+#include <math.h>
+#include "esp_err.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "led_strip.h"
+
+#define LED_GPIO   48
+#define LED_BRIGHT 50   // 0-255
+
+static void rainbow_task(void *arg) {
+    led_strip_handle_t strip;
+    led_strip_config_t cfg = {
+        .strip_gpio_num = LED_GPIO,
+        .max_leds = 1,
+        .led_model = LED_MODEL_WS2812,
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
+    };
+    led_strip_rmt_config_t rmt = {
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = 10 * 1000 * 1000,
+    };
+    ESP_ERROR_CHECK(led_strip_new_rmt_device(&cfg, &rmt, &strip));
+
+    float hue = 0;
+    while (1) {
+        float x = hue / 60.0f, f = x - floorf(x), q = 1 - f;
+        float r, g, b;
+        switch ((int)x % 6) {
+            case 0: r = 1; g = f; b = 0; break;
+            case 1: r = q; g = 1; b = 0; break;
+            case 2: r = 0; g = 1; b = f; break;
+            case 3: r = 0; g = q; b = 1; break;
+            case 4: r = f; g = 0; b = 1; break;
+            default: r = 1; g = 0; b = q; break;
+        }
+        led_strip_set_pixel(strip, 0,
+            (uint8_t)(powf(r, 2.2f) * LED_BRIGHT + 0.5f),
+            (uint8_t)(powf(g, 2.2f) * LED_BRIGHT + 0.5f),
+            (uint8_t)(powf(b, 2.2f) * LED_BRIGHT + 0.5f));
+        led_strip_refresh(strip);
+        hue += 0.5f;
+        if (hue >= 360) hue -= 360;
+        vTaskDelay(pdMS_TO_TICKS(25));
+    }
+}
+
 void app_main(void)
 {
+    xTaskCreate(rainbow_task, "rainbow", 4096, NULL, 1, NULL);
     ESP_LOGI(TAG, "Inicializando NVS...");
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
