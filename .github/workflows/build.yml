@@ -1,0 +1,60 @@
+name: ESP32-S3 Firmware Build
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build:
+    name: Build esp32s3o-finware (IDF v6.0.1 · esp32s3)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build con ESP-IDF v6.0.1
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v6.0.1
+          target: esp32s3
+          path: '.'
+          command: idf.py build
+
+      - name: Upload bootloader
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootloader
+          path: build/bootloader/bootloader.bin
+          retention-days: 30
+
+      - name: Upload partition table
+        uses: actions/upload-artifact@v4
+        with:
+          name: partition-table
+          path: build/partition_table/partition-table.bin
+          retention-days: 30
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32s3o-finware
+          path: build/esp32s3o-finware.bin
+          retention-days: 30
+
+      - name: Upload FULL (los 3 juntos)
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32s3o-finware-FULL
+          path: |
+            build/bootloader/bootloader.bin
+            build/partition_table/partition-table.bin
+            build/esp32s3o-finware.bin
+          retention-days: 30
