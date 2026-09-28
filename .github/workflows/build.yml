@@ -33,7 +33,7 @@ jobs:
           esp_idf_version: v6.0.1
           target: esp32s3
           path: '.'
-          command: export CCACHE_DIR=$PWD/.ccache && idf.py --ccache build
+          command: export CCACHE_DIR=$PWD/.ccache && idf.py --ccache reconfigure && sh fix_led_strip.sh && idf.py --ccache build
 
       - name: Reunir los 3 .bin
         run: |
