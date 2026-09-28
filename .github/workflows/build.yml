@@ -35,33 +35,17 @@ jobs:
           path: '.'
           command: export CCACHE_DIR=$PWD/.ccache && idf.py --ccache build
 
-      - name: Upload bootloader
-        uses: actions/upload-artifact@v4
-        with:
-          name: bootloader
-          path: build/bootloader/bootloader.bin
-          retention-days: 30
+      - name: Reunir los 3 .bin
+        run: |
+          mkdir -p finware
+          cp build/bootloader/bootloader.bin finware/
+          cp build/partition_table/partition-table.bin finware/
+          cp build/esp32s3o-finware.bin finware/
 
-      - name: Upload partition table
+      - name: Upload finware
         uses: actions/upload-artifact@v4
         with:
-          name: partition-table
-          path: build/partition_table/partition-table.bin
-          retention-days: 30
-
-      - name: Upload firmware
-        uses: actions/upload-artifact@v4
-        with:
-          name: esp32s3o-finware
-          path: build/esp32s3o-finware.bin
-          retention-days: 30
-
-      - name: Upload FULL (los 3 juntos)
-        uses: actions/upload-artifact@v4
-        with:
-          name: esp32s3o-finware-FULL
-          path: |
-            build/bootloader/bootloader.bin
-            build/partition_table/partition-table.bin
-            build/esp32s3o-finware.bin
+          name: finware
+          path: finware/
+          if-no-files-found: error
           retention-days: 30
