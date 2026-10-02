@@ -224,7 +224,7 @@ static void spectrum_task(void *arg)
         size_t o = 0;
         o += (size_t)snprintf(line + o, sizeof(line) - o, "2.4G[%" PRIu32 "us,%" PRIu32 "hit]: ",
                               r.sweep_us, r.hits);
-        for (uint32_t ch = 0; ch < NRF_DUAL_CHANNELS; ch += 4) {
+        for (uint32_t ch = 0; ch + 3 < NRF_DUAL_CHANNELS; ch += 4) {
             uint32_t hit = r.rpd[ch] | r.rpd[ch + 1] | r.rpd[ch + 2] | r.rpd[ch + 3];
             o += (size_t)snprintf(line + o, sizeof(line) - o, "%s", hit ? "#" : ".");
         }

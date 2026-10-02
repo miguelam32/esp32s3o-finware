@@ -16,7 +16,6 @@
 
 #include "rf_core.h"
 
-static const char *TAG = "rf_inject";
 
 /* offsets de cabecera 802.11 */
 #define H_FC     0
