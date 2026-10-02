@@ -53,7 +53,6 @@ jobs:
           # set-target configura y baja los managed_components (una sola configuracion)
           idf.py --ccache set-target esp32s3
           # parche del led_strip: DESPUES de bajar los componentes y ANTES de compilar
-          sh fix_led_strip.sh
           idf.py --ccache build
 
       - name: Stats de ccache
