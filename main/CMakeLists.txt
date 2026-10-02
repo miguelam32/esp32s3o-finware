@@ -1,12 +1,28 @@
 idf_component_register(
-    SRCS "main.c"
-    INCLUDE_DIRS "."
+    SRCS
+        "main.c"
+        "src/rf_core.c"
+        "src/rf_sniffer.c"
+        "src/rf_inject.c"
+        "src/karma.c"
+        "src/nrf24.c"
+        "src/nrf24_dual.c"
+        "src/ws2812.c"
+    INCLUDE_DIRS
+        "."
+        "src"
     REQUIRES
-        esp_tinyusb
-        esp_wifi
-        esp_netif
-        esp_event
         nvs_flash
-        lwip
-        led_strip
+        esp_wifi
+        esp_event
+        esp_netif
+        esp_psram
+        esp_timer
+        esp_driver_spi
+        esp_driver_gpio
+        esp_driver_rmt
+        esp_hw_support
+        heap
+        freertos
+        log
 )

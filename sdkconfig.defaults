@@ -1,54 +1,89 @@
+# =============================================================================
+# esp32s3o-finware | ESP-IDF v6.0.1 | sdkconfig.defaults (modo velocidad)
+# Asume ESP32-S3 N16R8: flash quad 16MB + PSRAM octal 8MB.
+# Despues de cambiar este archivo: rm sdkconfig && idf.py set-target esp32s3
+# =============================================================================
+
+# ---- Target / flash ----
 CONFIG_IDF_TARGET="esp32s3"
-
-# Particiones (16MB)
-CONFIG_PARTITION_TABLE_CUSTOM=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
-
-# Flash 16MB quad a 80MHz
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+# App unica de 1.5 MB, sin OTA; ignora partitions.csv y deja libre el resto del flash.
+# Si la app no cabe o quieres OTA/FS: CONFIG_PARTITION_TABLE_CUSTOM=y + partitions.csv
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
 
-# CPU a 240MHz
+# ---- CPU / FreeRTOS ----
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_FREERTOS_HZ=1000
+# FreeRTOS en IRAM: sin esperas por cache miss en flash (en v6.0 el default es flash)
+CONFIG_FREERTOS_IN_IRAM=y
+# Igual para esp_ringbuf (xRingbuffer*): en v6.0 tambien paso a flash por defecto
+CONFIG_RINGBUF_IN_IRAM=y
+# Menos overhead al entrar a una ISR (se pierde el backtrace ISR -> tarea)
+CONFIG_FREERTOS_INTERRUPT_BACKTRACE=n
 
-# PSRAM octal 8MB a 80MHz
+# ---- Compilador (-O2) ----
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+# SOLO para release: ESP_ERROR_CHECK deja de abortar y los fallos pasan callados.
+# En v6.0 assert(expr) tampoco evalua expr con esto: sin efectos secundarios dentro.
+# CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_DISABLE=y
+
+# ---- Caches al maximo (cuestan ~48 KB de RAM interna) ----
+CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
+CONFIG_ESP32S3_INSTRUCTION_CACHE_8WAYS=y
+CONFIG_ESP32S3_INSTRUCTION_CACHE_LINE_32B=y
+CONFIG_ESP32S3_DATA_CACHE_64KB=y
+CONFIG_ESP32S3_DATA_CACHE_8WAYS=y
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+
+# ---- PSRAM octal a 80 MHz (el ring de captura vive aqui) ----
+# Pines: la PSRAM octal ocupa GPIO35, 36 y 37; no usarlos para los nRF24.
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
+# malloc <= 4KB se queda en RAM interna (rapida); lo grande va a PSRAM
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
-CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_SPIRAM_MEMTEST=n
+# Codigo + rodata corren desde PSRAM: la cache ya no se apaga durante
+# escrituras a flash. Ojo: comparte cache con el ring de captura.
+# CONFIG_SPIRAM_XIP_FROM_PSRAM=y
 
-# Caches al maximo
-CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
-CONFIG_ESP32S3_INSTRUCTION_CACHE_LINE_32B=y
-CONFIG_ESP32S3_DATA_CACHE_64KB=y
-CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+# ---- SPI (nRF24) y GPIO en IRAM: latencia minima ----
+CONFIG_SPI_MASTER_IN_IRAM=y
+CONFIG_SPI_MASTER_ISR_IN_IRAM=y
+CONFIG_GPIO_CTRL_FUNC_IN_IRAM=y
 
-# Compilador: velocidad
-CONFIG_COMPILER_OPTIMIZATION_PERF=y
-CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y
-CONFIG_COMPILER_DISABLE_DEFAULT_ERRORS=y
-
-# FreeRTOS
-CONFIG_FREERTOS_HZ=1000
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
-
-# WiFi / LwIP en IRAM y buffers grandes
+# ---- Wi-Fi ----
+# Ojo RAM interna: buffers dinamicos altos + caches grandes. Vigila
+# heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) bajo carga.
+CONFIG_ESP_WIFI_ENABLED=y
 CONFIG_ESP_WIFI_IRAM_OPT=y
 CONFIG_ESP_WIFI_RX_IRAM_OPT=y
-CONFIG_LWIP_IRAM_OPTIMIZATION=y
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER=y
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=64
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=64
-CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=y
-CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=y
 
-# Logs por UART (CP2102), USB nativo libre para TinyUSB
-CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+# ---- LwIP en IRAM (util si mandas datos por UDP/TCP) ----
+# CONFIG_LWIP_IRAM_OPTIMIZATION=y
 
-# TinyUSB HID
-CONFIG_TINYUSB_HID_ENABLED=y
-CONFIG_TINYUSB_HID_COUNT=1
+# ---- Sin power management ----
+CONFIG_PM_ENABLE=n
+
+# ---- Watchdog ----
+# Si una tarea fija al core 1 hace polling sin ceder (nRF24), descomenta:
+# CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
+
+# ---- Logs (INFO si estas depurando) ----
+CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+
+# ---- EXPERIMENTAL: PSRAM a 120 MHz DDR ----
+# Espressif lo marca experimental, con riesgo de crash por temperatura.
+# Flash y PSRAM comparten reloj: revisa la tabla de combinaciones en la doc
+# "SPI Flash and External SPI RAM Configuration" antes de activarlo.
+# CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+# CONFIG_SPIRAM_SPEED_120M=y
+

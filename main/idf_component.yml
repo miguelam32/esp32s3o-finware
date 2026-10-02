@@ -1,3 +1,19 @@
-dependencies:
-  espressif/esp_tinyusb: "^1.4.0"
-  espressif/led_strip: "^2.5.0"
+# ---------------------------------------------------------------------------
+# esp32s3o-finware — manifiesto del componente main
+#
+# Todo el codigo propio (rf_core, rf_sniffer, rf_inject, karma, nrf24,
+# nrf24_dual) usa SOLO APIs incluidas en ESP-IDF 6.0.1. Ninguna se declara
+# aqui: van en REQUIRES de main/CMakeLists.txt.
+#
+# Las dependencias gestionadas solo se listan si de verdad se usan. El
+# gestor de componentes las DESCARGA siempre, aunque ningun .c las incluya.
+# ---------------------------------------------------------------------------
+
+version: "1.0.0"
+
+description: Firmware ofensivo propio para ESP32-S3 (ESP-IDF 6.0.1)
+
+targets:
+  - esp32s3
+
+# Sin dependencies: nada que descargar, nada que romperse entre versiones.
