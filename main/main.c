@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
+#include <inttypes.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -19,6 +20,7 @@
 #include "nvs_flash.h"
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "esp_wifi.h"
 #include "esp_wifi_types.h"
 
 #include "rf_core.h"
@@ -220,7 +222,7 @@ static void spectrum_task(void *arg)
 
         char line[160];
         size_t o = 0;
-        o += (size_t)snprintf(line + o, sizeof(line) - o, "2.4G[%uus,%uhit]: ",
+        o += (size_t)snprintf(line + o, sizeof(line) - o, "2.4G[%" PRIu32 "us,%" PRIu32 "hit]: ",
                               r.sweep_us, r.hits);
         for (uint32_t ch = 0; ch < NRF_DUAL_CHANNELS; ch += 4) {
             uint32_t hit = r.rpd[ch] | r.rpd[ch + 1] | r.rpd[ch + 2] | r.rpd[ch + 3];
