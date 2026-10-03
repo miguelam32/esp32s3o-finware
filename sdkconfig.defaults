@@ -1,6 +1,6 @@
 # =============================================================================
 # esp32s3o-finware | ESP-IDF v6.0.1 | sdkconfig.defaults (modo velocidad)
-# ESP32-S3 N16R8: flash QIO 16MB + PSRAM octal 8MB.
+# ESP32-S3 N16R8: flash QIO 16MB + PSRAM embebida 8MB (NO octal externa).
 # Cambios aqui: rm sdkconfig && idf.py set-target esp32s3
 # =============================================================================
 
@@ -9,22 +9,20 @@ CONFIG_IDF_TARGET="esp32s3"
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
-# App unica de 1.5 MB. Ignora partitions.csv -> factory cae en 0x10000.
-# Para OTA/FS: CONFIG_PARTITION_TABLE_CUSTOM=y + CUSTOM_FILENAME="partitions.csv"
-CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+# ---- Tabla de particiones: nuestra partitions.csv ----
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # ---- CPU / FreeRTOS ----
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_FREERTOS_HZ=1000
-# FreeRTOS + ringbuf en IRAM: nuestras tareas hacen polling, no quieren
-# esperas por cache miss en flash.
 CONFIG_FREERTOS_IN_IRAM=y
 CONFIG_RINGBUF_IN_IRAM=y
 CONFIG_FREERTOS_INTERRUPT_BACKTRACE=n
 
 # ---- Compilador ----
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
-# Deja los asserts activos: si algo revienta, quiero el backtrace.
 
 # ---- Caches (cuestan ~48 KB de RAM interna) ----
 CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
@@ -34,16 +32,17 @@ CONFIG_ESP32S3_DATA_CACHE_64KB=y
 CONFIG_ESP32S3_DATA_CACHE_8WAYS=y
 CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
 
-# ---- PSRAM octal 80 MHz (el ring de captura vive aqui) ----
-# PSRAM octal ocupa GPIO35, 36 y 37: NO usarlos para los nRF24.
-CONFIG_SPIRAM=y
-CONFIG_SPIRAM_MODE_OCT=y
-CONFIG_SPIRAM_SPEED_80M=y
-CONFIG_SPIRAM_USE_MALLOC=y
-# malloc <= 4KB se queda en RAM interna; lo grande va a PSRAM
-CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
-CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
-CONFIG_SPIRAM_MEMTEST=n
+# ---- PSRAM: DESACTIVADA ----
+# Tu chip es QFN56 con PSRAM embebida (8MB), pero el bootloader se cuelga
+# (TG0WDT_SYS_RST) al intentar inicializarla en modo octal. Hasta resolver
+# eso, el ring de captura vive en RAM interna (ver rf_core.c, 64 slots).
+CONFIG_SPIRAM=n
+# CONFIG_SPIRAM_MODE_OCT=y
+# CONFIG_SPIRAM_SPEED_80M=y
+# CONFIG_SPIRAM_USE_MALLOC=y
+# CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+# CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+# CONFIG_SPIRAM_MEMTEST=n
 
 # ---- SPI (nRF24) y GPIO en IRAM: latencia minima ----
 CONFIG_SPI_MASTER_IN_IRAM=y
@@ -53,7 +52,6 @@ CONFIG_GPIO_CTRL_FUNC_IN_IRAM=y
 # ---- Wi-Fi ----
 CONFIG_ESP_WIFI_ENABLED=y
 CONFIG_ESP_WIFI_IRAM_OPT=y
-# La callback promiscua corre desde ISR: que el camino de RX sea IRAM
 CONFIG_ESP_WIFI_RX_IRAM_OPT=y
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER=y
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=16
@@ -64,20 +62,8 @@ CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=64
 CONFIG_PM_ENABLE=n
 
 # ---- Watchdog ----
-# Si una tarea fijada a un core hace polling sin ceder (barrido nRF24),
-# descomenta la del core que uses:
 # CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
 
 # ---- Logs ----
-# CAMBIO: WARN -> INFO. Nuestro firmware reporta por ESP_LOGI; con WARN
-# no se ve nada en el monitor y no se puede depurar.
-# Para produccion (menos ruido) vuelve a WARN.
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LOG_MAXIMUM_LEVEL=3
-
-# ---- EXPERIMENTAL: PSRAM 120 MHz DDR ----
-# Espressif lo marca experimental: riesgo de crash por temperatura.
-# Flash y PSRAM comparten reloj: revisa la tabla de combinaciones de la doc
-# "SPI Flash and External SPI RAM Configuration" antes de activarlo.
-# CONFIG_IDF_EXPERIMENTAL_FEATURES=y
-# CONFIG_SPIRAM_SPEED_120M=y

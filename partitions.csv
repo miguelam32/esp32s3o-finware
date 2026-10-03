@@ -1,7 +1,11 @@
-# Name,   Type, SubType, Offset,   Size
+# esp32s3o-finware | tabla de particiones (16 MB)
+# nvs      : calibracion WiFi y contadores
+# otadata  : datos OTA. Vacio -> el bootloader arranca 'factory'
+# phy_init : calibracion RF (la escribe el bootloader)
+# factory  : nuestro firmware, se flashea en 0x20000
+# storage  : espacio libre para Evil Portal / SPIFFS mas adelante
 nvs,      data, nvs,     0x9000,   24K,
 otadata,  data, ota,     0xf000,   8K,
 phy_init, data, phy,     0x11000,  4K,
 factory,  app,  factory, 0x20000,  4M,
-ota_0,    app,  ota_0,   0x420000, 4M,
-storage,  data, spiffs,  0x820000, 0x7E0000,
+storage,  data, spiffs,  0x420000, 0xBE0000,
