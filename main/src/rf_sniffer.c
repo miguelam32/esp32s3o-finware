@@ -3,7 +3,7 @@
  *
  * Sin malloc, sin String, sin Arduino. Todo son offsets y structs fijas.
  * El hash de la tabla es abierto con linear probing: O(1) amortizado y
- * sin listas enlazadas que fragmenten PSRAM.
+ * sin listas enlazadas que fragmenten la RAM interna.
  */
 #include <string.h>
 #include <stdint.h>
@@ -104,10 +104,10 @@ esp_err_t rf_ap_table_init(void)
 {
     if (s_ap != NULL) return ESP_OK;
     s_ap = heap_caps_calloc(1, (size_t)RF_AP_TABLE_MAX * sizeof(rf_ap_entry_t),
-                            MALLOC_CAP_SPIRAM);
+                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (s_ap == NULL) return ESP_ERR_NO_MEM;
     s_ap_count = 0;
-    ESP_LOGI(TAG, "tabla AP: %u entradas en PSRAM", (unsigned)RF_AP_TABLE_MAX);
+    ESP_LOGI(TAG, "tabla AP: %u entradas en RAM interna", (unsigned)RF_AP_TABLE_MAX);
     return ESP_OK;
 }
 

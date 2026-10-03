@@ -2,7 +2,7 @@
  * rf_core.h — nucleo de radio de esp32s3o-finware
  *
  *   1. La callback promiscua NO parsea nada. Solo copia al siguiente slot
- *      libre de un ring en PSRAM y publica un indice.
+ *      libre de un ring en RAM interna y publica un indice.
  *   2. Un consumidor dedicado (core 1) parsea a su ritmo. Lock-free.
  *   3. La inyeccion tiene su propia tarea en core 0, junto al stack Wi-Fi.
  *   4. El salto de canal es otra tarea: escanear y atacar a la vez.
@@ -23,7 +23,7 @@ extern "C" {
 #endif
 
 #define RF_FRAME_MAX     2344u
-#define RF_RING_SLOTS    256u
+#define RF_RING_SLOTS    32u      /* RAM interna (512KB total): antes 256u en PSRAM */
 #define RF_TXQ_DEPTH     16u
 #define RF_AP_TABLE_MAX  256u
 #define RF_SSID_MAX      33u
@@ -79,7 +79,7 @@ typedef struct {
     char     ssid[RF_SSID_MAX];
 } rf_mgmt_info_t;
 
-/* Tabla de APs: hash abierto en PSRAM, sin allocations en caliente. */
+/* Tabla de APs: hash abierto en RAM interna, sin allocations en caliente. */
 typedef struct {
     uint8_t  bssid[6];
     uint8_t  chan;

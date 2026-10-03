@@ -39,7 +39,7 @@ static const char *TAG = "rf_core";
 #define RF_WMB() __asm__ __volatile__("memw" ::: "memory")
 
 /* ------------------------------------------------------------------ */
-static rf_frame_t   *s_ring;              /* ring en PSRAM             */
+static rf_frame_t   *s_ring;              /* ring en RAM interna       */
 static volatile uint32_t s_head;          /* productor  (callback)     */
 static volatile uint32_t s_tail;          /* consumidor (tarea)        */
 static volatile int   s_running;
@@ -214,20 +214,15 @@ esp_err_t rf_core_init(void)
 {
     if (s_ring != NULL) return ESP_OK;
 
-    size_t psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
-    size_t need  = (size_t)RF_RING_SLOTS * sizeof(rf_frame_t);
+    size_t internal = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
+    size_t need     = (size_t)RF_RING_SLOTS * sizeof(rf_frame_t);
 
-    ESP_LOGI(TAG, "PSRAM: %u KB / ring necesita %u KB",
-             (unsigned)(psram / 1024), (unsigned)(need / 1024));
+    ESP_LOGI(TAG, "RAM interna: %u KB / ring necesita %u KB",
+             (unsigned)(internal / 1024), (unsigned)(need / 1024));
 
-    if (psram < need) {
-        ESP_LOGE(TAG, "PSRAM insuficiente: baja RF_RING_SLOTS en rf_core.h");
-        return ESP_ERR_NO_MEM;
-    }
-
-    s_ring = heap_caps_calloc(1, need, MALLOC_CAP_SPIRAM);
+    s_ring = heap_caps_calloc(1, need, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (s_ring == NULL) {
-        ESP_LOGE(TAG, "heap_caps_calloc(SPIRAM) fallo");
+        ESP_LOGE(TAG, "heap_caps_calloc(INTERNAL) fallo: baja RF_RING_SLOTS en rf_core.h");
         return ESP_ERR_NO_MEM;
     }
 
