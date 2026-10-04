@@ -20,11 +20,11 @@ permissions:
 
 jobs:
   build:
-    name: Build esp32s3o-finware (IDF v6.0.1 · esp32s3)
+    name: Build esp32s3o-finware (IDF v6.0.3 · esp32s3)
     runs-on: ubuntu-24.04
     timeout-minutes: 25
-    # Si el tag v6.0.1 no existe en Docker Hub, usa: espressif/idf:release-v6.0
-    container: espressif/idf:v6.0.1
+    # Si el tag v6.0.3 no existe en Docker Hub, usa: espressif/idf:release-v6.0
+    container: espressif/idf:v6.0.3
     env:
       CCACHE_DIR: /tmp/ccache
       CCACHE_MAXSIZE: 500M
@@ -42,10 +42,10 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: /tmp/ccache
-          key: ccache-${{ runner.os }}-idf6.0.1-${{ github.sha }}
-          restore-keys: ccache-${{ runner.os }}-idf6.0.1-
+          key: ccache-${{ runner.os }}-idf6.0.3-${{ github.sha }}
+          restore-keys: ccache-${{ runner.os }}-idf6.0.3-
 
-      - name: Build con ESP-IDF v6.0.1
+      - name: Build con ESP-IDF v6.0.3
         run: |
           git config --global --add safe.directory '*'
           ccache --zero-stats
@@ -65,7 +65,7 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: /tmp/ccache
-          key: ccache-${{ runner.os }}-idf6.0.1-${{ github.sha }}
+          key: ccache-${{ runner.os }}-idf6.0.3-${{ github.sha }}
 
       - name: Reunir los 3 .bin
         run: |
