@@ -45,6 +45,15 @@ jobs:
           key: ccache-${{ runner.os }}-idf6.0.3-${{ github.sha }}
           restore-keys: ccache-${{ runner.os }}-idf6.0.3-
 
+      - name: Verificar version de ESP-IDF
+        run: |
+          git config --global --add safe.directory '*'
+          . "$IDF_PATH/export.sh"
+          V=$(idf.py --version)
+          echo "Version reportada: $V"
+          git -C "$IDF_PATH" describe --tags || true
+          echo "$V" | grep -q "6.0.3" || { echo "VERSION INCORRECTA"; exit 1; }
+
       - name: Build con ESP-IDF v6.0.3
         run: |
           git config --global --add safe.directory '*'
