@@ -25,6 +25,14 @@ static void nrf24_apply_rfsetup(nrf24_dev_t *dev) {
     nrf24_write_reg(dev, NRF24_REG_RF_SETUP, rf);
 }
 
+// NOP devuelve STATUS en el byte de MISO
+uint8_t nrf24_get_status(nrf24_dev_t *dev) {
+    uint8_t tx = NRF24_CMD_NOP;
+    uint8_t rx = 0;
+    nrf24_spi_xfer(dev, &tx, &rx, 1);
+    return rx;
+}
+
 esp_err_t nrf24_init(nrf24_dev_t *dev, const nrf24_pins_t *pins) {
     esp_err_t err;
 
@@ -48,7 +56,7 @@ esp_err_t nrf24_init(nrf24_dev_t *dev, const nrf24_pins_t *pins) {
     }
 
     spi_device_interface_config_t devcfg = {
-        .clock_speed_hz = 10 * 1000 * 1000,   // 10 MHz
+        .clock_speed_hz = 10 * 1000 * 1000,   // 10 MHz — máximo del nRF24
         .mode = 0,
         .spics_io_num = pins->pin_csn,
         .queue_size = 7,
@@ -90,11 +98,22 @@ esp_err_t nrf24_init(nrf24_dev_t *dev, const nrf24_pins_t *pins) {
     uint8_t flush = NRF24_CMD_FLUSH_TX;
     nrf24_spi_xfer(dev, &flush, NULL, 1);
 
-    if (!nrf24_is_present(dev)) {
-        ESP_LOGW(TAG, "NRF24 host=%d NO DETECTADO (revisá cables)",
-                 pins->spi_host);
+    // ═══════════ TEST DE COMUNICACIÓN ═══════════
+    dev->present = nrf24_is_present(dev);
+    uint8_t st = nrf24_get_status(dev);
+
+    if (!dev->present) {
+        ESP_LOGE(TAG, "NRF24 host=%d NO RESPONDE (STATUS=0x%02X)", pins->spi_host, st);
+        if (st == 0x00) {
+            ESP_LOGE(TAG, "  -> 0x00 = sin energia / CSN o CE mal / módulo muerto");
+        } else if (st == 0xFF) {
+            ESP_LOGE(TAG, "  -> 0xFF = MISO colgado (cable roto, MISO/MOSI invertidos)");
+        } else {
+            ESP_LOGE(TAG, "  -> STATUS inesperado: cables largos? bajá el clock a 1MHz");
+        }
     } else {
-        ESP_LOGI(TAG, "NRF24 host=%d OK, PA_MAX armed", pins->spi_host);
+        ESP_LOGI(TAG, "NRF24 host=%d OK, PA_MAX armed (STATUS=0x%02X)",
+                 pins->spi_host, st);
     }
     return ESP_OK;
 }
@@ -133,7 +152,7 @@ esp_err_t nrf24_stop_carrier(nrf24_dev_t *dev) {
     return nrf24_write_reg(dev, NRF24_REG_RF_SETUP, rf);
 }
 
-// Hop rápido: SIN power-cycle (eso mataba tu duty cycle)
+// Hop rápido: SIN power-cycle
 esp_err_t nrf24_carrier_hop(nrf24_dev_t *dev, uint8_t new_channel) {
     if (new_channel > 125) new_channel = 125;
     dev->current_channel = new_channel;
@@ -152,7 +171,6 @@ void nrf24_hop_random(nrf24_dev_t *dev, uint8_t ch_min, uint8_t ch_max) {
     if (dev->spam) {
         nrf24_pulse_tx(dev, ch);
     } else {
-        // cambio de canal en caliente, CE sigue alto
         nrf24_write_reg(dev, NRF24_REG_RF_CH, ch);
         ets_delay_us(150);
     }
@@ -187,7 +205,7 @@ esp_err_t nrf24_pulse_tx(nrf24_dev_t *dev, uint8_t channel) {
     gpio_set_level(dev->pins.pin_ce, 0);
     ets_delay_us(15);
     gpio_set_level(dev->pins.pin_ce, 1);   // dispara paquete
-    ets_delay_us(260);                     // ~32B a 2Mbps = ocupa 2 canales
+    ets_delay_us(260);                     // ~32B a 2Mbps
     return ESP_OK;
 }
 

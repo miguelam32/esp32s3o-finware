@@ -65,6 +65,7 @@ typedef struct {
     nrf24_pins_t pins;
     spi_device_handle_t spi;
     bool initialized;
+    bool present;           // ← NUEVO: respondió por SPI (STATUS != 0x00/0xFF)
     bool spam;              // true = ráfaga de paquetes (clones Si24R1)
     uint8_t current_channel;
     uint8_t current_pa;
@@ -80,6 +81,7 @@ esp_err_t nrf24_start_carrier(nrf24_dev_t *dev, uint8_t channel);
 esp_err_t nrf24_stop_carrier(nrf24_dev_t *dev);
 esp_err_t nrf24_carrier_hop(nrf24_dev_t *dev, uint8_t new_channel);
 bool nrf24_is_present(nrf24_dev_t *dev);
+uint8_t nrf24_get_status(nrf24_dev_t *dev);   // ← NUEVO
 
 // ═══════════ JAMMER ═══════════
 void     nrf24_set_spam(nrf24_dev_t *dev, bool enable);
