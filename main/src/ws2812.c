@@ -13,6 +13,8 @@
 
 #include "esp_log.h"
 #include "driver/gpio.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "led_strip.h"
 #include "sdkconfig.h"
 
@@ -119,7 +121,7 @@ static void ws_task(void *arg)
             case WS_MODE_OFF:
             default:              led_strip_clear(s_strip); break;
         }
-        vTaskDelayUntil(&last, period);
+        xTaskDelayUntil(&last, period);
     }
 }
 

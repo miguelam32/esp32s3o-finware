@@ -26,7 +26,13 @@ extern "C" {
 #endif
 
 #define NRF_MAX_DEV   4
-#define NRF_MAX_XFER  33          /* 1 byte comando + 32 payload */
+#define NRF_MAX_XFER  33
+
+/* Bits del event group (espera de RX/TX) */
+#define NRF_EVT_RX      (1u << 0)
+#define NRF_EVT_TX      (1u << 1)
+#define NRF_EVT_MAX_RT  (1u << 2)
+#define NRF_EVT_MAX_RT  (1u << 2)
 
 /* ---- registros ---- */
 #define NRF_CONFIG      0x00
