@@ -1,6 +1,6 @@
 # =============================================================================
 #  sdkconfig.defaults · ESP32-S3 N16R8 · ESP-IDF 6.0.3
-#  Modulo: 16 MB flash QUAD + 8 MB PSRAM OCTAL
+#  Modulo: 16 MB flash QUAD + 8 MB PSRAM OCTAL (embebida)
 #  Radios: Wi-Fi del S3 (solo ENVIAR datos) + 2x NRF24L01 por SPI (solo enviar)
 #  Meta: maximo rendimiento ESTABLE. Nada experimental.
 #
@@ -33,6 +33,8 @@ CONFIG_FREERTOS_IN_IRAM=y
 # (y por ende jitter) entre transacciones hacia los NRF24. Depende de
 # FREERTOS_IN_IRAM (ya activo arriba).
 CONFIG_SPI_MASTER_IN_IRAM=y
+# La ISR del SPI maestro tambien en IRAM. Es el default, lo dejo explicito.
+CONFIG_SPI_MASTER_ISR_IN_IRAM=y
 # CONFIG_GPIO_ISR_IRAM_SAFE: lo quite a proposito. Servia para que el IRQ del
 # NRF24 sobreviviera a una escritura a flash con el cache apagado, pero con
 # XIP desde PSRAM (abajo) el cache NO se apaga en operaciones de flash, asi
@@ -42,13 +44,17 @@ CONFIG_SPI_MASTER_IN_IRAM=y
 # --- Compilador --------------------------------------------------------------
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 
-# --- Flash: 16 MB, quad --------------------------------------------------------
+# --- Flash: 16 MB, QUAD --------------------------------------------------------
+# La flash de este modulo es quad. NO actives ESPTOOLPY_OCT_FLASH (eso es para
+# los modulos N16R8V / N32R16V con flash octal).
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 # Si el modulo no arranca en QIO, cambia a DIO (CONFIG_ESPTOOLPY_FLASHMODE_DIO=y)
 
-# --- PSRAM: octal 8 MB a 80 MHz ------------------------------------------------
+# --- PSRAM: OCTAL 8 MB a 80 MHz --------------------------------------------------
+# SPIRAM_MODE_OCT es lo que le dice al S3 que la PSRAM es octal. Sin esta
+# linea la PSRAM no inicializa y el arranque truena.
 # (120 MHz es experimental y falla con cambios de temperatura: no se usa)
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
@@ -155,6 +161,8 @@ CONFIG_LOG_DEFAULT_LEVEL_WARN=y
 #   problemas cuando el chip se calienta.
 # - FREERTOS_SMP: kernel beta de Espressif. No hace falta: repartir tareas
 #   entre cores se hace con xTaskCreatePinnedToCore en el FreeRTOS normal.
+# - Deep sleep / RTC_CLK_SRC: no hay simbolos CONFIG_ESP32S3_DEEP_SLEEP ni
+#   CONFIG_ESP32S3_RTC_CLK_SRC; y deep sleep no se usa aqui.
 
 # =============================================================================
 #  NOTAS - esto NO es sdkconfig, va en tu codigo:
