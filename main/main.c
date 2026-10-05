@@ -35,7 +35,6 @@ typedef enum {
 
 static jam_mode_t current_mode = MODE_STOP;
 static bool jamming_active = false;
-static uint32_t hop_delay_ms = 1; // ¡1ms para máxima agresividad!
 
 // ============================================================
 // CONFIGURACIÓN MAESTRA DEL NRF24 (PARA MÁXIMA POTENCIA)
@@ -186,7 +185,6 @@ void app_main(void) {
         .pin_sck  = RADIO1_SCK,
         .pin_mosi = RADIO1_MOSI,
         .pin_miso = RADIO1_MISO,
-        .pin_irq  = GPIO_NUM_NC
     };
 
     esp_err_t err = nrf24_init(&radio1, &r1_pins);
