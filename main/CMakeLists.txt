@@ -1,20 +1,12 @@
 idf_component_register(
     SRCS
         "main.c"
-        "jammer.c"
-        "src/ws2812.c"
     INCLUDE_DIRS
         "."
-        "src"
     REQUIRES
-        nvs_flash
-        esp_timer
         esp_driver_spi
         esp_driver_gpio
-        esp_driver_rmt
-        esp_hw_support
-        heap
+        esp_rom
         freertos
         log
-        led_strip
 )
