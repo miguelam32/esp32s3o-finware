@@ -527,7 +527,12 @@ void nrf24_cw_start(nrf24_dev_t *d, uint8_t ch, nrf24_pa_t pa)
     c &= (uint8_t)~NRF_CFG_PRIM_RX;
     wr(d, NRF_CONFIG, c);
 
-    nrf24_set_pa(d, pa);
+    {
+        uint8_t s = rd(d, NRF_RF_SETUP);
+        s &= (uint8_t)~0x06u;
+        s |= (uint8_t)(((uint8_t)pa & 0x03u) << 1);
+        wr(d, NRF_RF_SETUP, s);
+    }
     wr(d, NRF_RF_CH, (uint8_t)(ch & 0x7F));
 
     uint8_t s = rd(d, NRF_RF_SETUP);
