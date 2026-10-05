@@ -1,4 +1,4 @@
-.menu "NRF24 dual"
+menu "NRF24 dual"
     config NRF1_CE_GPIO
         int "Radio 1 (SPI2): CE"
         default 9

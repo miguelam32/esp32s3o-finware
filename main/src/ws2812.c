@@ -12,6 +12,7 @@
 #include "ws2812.h"
 
 #include "esp_log.h"
+#include "driver/gpio.h"
 #include "led_strip.h"
 #include "sdkconfig.h"
 
