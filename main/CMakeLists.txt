@@ -1,22 +1,13 @@
 idf_component_register(
     SRCS
         "main.c"
-        "src/rf_core.c"
-        "src/rf_sniffer.c"
-        "src/rf_inject.c"
-        "src/karma.c"
-        "src/nrf24.c"
-        "src/nrf24_dual.c"
+        "jammer.c"
         "src/ws2812.c"
     INCLUDE_DIRS
         "."
         "src"
     REQUIRES
         nvs_flash
-        esp_wifi
-        esp_event
-        esp_netif
-        esp_psram
         esp_timer
         esp_driver_spi
         esp_driver_gpio
