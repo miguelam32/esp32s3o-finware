@@ -25,4 +25,5 @@ idf_component_register(
         heap
         freertos
         log
+        led_strip
 )

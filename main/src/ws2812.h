@@ -1,13 +1,10 @@
 /*
- * ws2812.h — driver WS2812/WS2812B minimo sobre RMT nativo (ESP-IDF 6.0.1)
- *
- * Usa la API nueva (rmt_new_tx_channel + rmt_new_copy_encoder), que es la
- * unica que existe en IDF 6.0: la legacy (driver/rmt.h) fue eliminada.
- *
- * Cero dependencias externas: todo vive en IDF.
+ * ws2812.h - LED WS2812 con arcoiris lento + latido del jammer.
+ * Usa el componente oficial led_strip (backend RMT).
  */
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
 
@@ -15,18 +12,25 @@
 extern "C" {
 #endif
 
-/* GPIO48 = LED RGB del ESP32-S3 DevKitC-1 (N16R8).
- * Si tu placa es otra y no enciende, prueba 38, 47 o 2. */
-#ifndef WS2812_GPIO
-#define WS2812_GPIO 48
-#endif
+typedef enum {
+    WS_MODE_OFF = 0,
+    WS_MODE_RAINBOW,     /* arcoiris lento, una vuelta cada ~24 s */
+    WS_MODE_BREATHE,     /* respiracion blanquiazul ~4 s           */
+    WS_MODE_PULSE,       /* destello corto: 1 por radio emitiendo  */
+    WS_MODE_SOLID,       /* color fijo                            */
+} ws_mode_t;
 
-esp_err_t ws2812_init(int gpio);
-void      ws2812_set(uint8_t r, uint8_t g, uint8_t b);   /* bloqueante */
-void      ws2812_off(void);
+esp_err_t  ws2812_init(void);
+void       ws2812_deinit(void);
+bool       ws2812_ready(void);
 
-/* Rueda clasica de color: pos 0..255 cicla de forma continua. */
-void      ws2812_wheel(uint8_t pos, uint8_t *r, uint8_t *g, uint8_t *b);
+void       ws2812_set_mode(ws_mode_t mode);
+ws_mode_t  ws2812_get_mode(void);
+void       ws2812_set_rgb(uint8_t r, uint8_t g, uint8_t b);
+void       ws2812_set_brightness(uint8_t br);   /* 0..255 */
+
+/* Llamar cada vez que una radio arranca a emitir */
+void       ws2812_notify(int count);
 
 #ifdef __cplusplus
 }

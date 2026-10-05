@@ -1,6 +1,4 @@
 version: "1.0.0"
-
-description: Firmware ofensivo propio para ESP32-S3 (ESP-IDF 6.0.3)
-
-targets:
-  - esp32s3
+dependencies:
+  idf: ">=6.0.3"
+  espressif/led_strip: "^3.0.0"
