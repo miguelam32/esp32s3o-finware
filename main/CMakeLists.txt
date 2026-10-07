@@ -7,8 +7,10 @@ idf_component_register(
         esp_driver_spi
         esp_driver_gpio
         esp_driver_gptimer
+        esp_driver_uart
         esp_timer
         esp_rom
         freertos
         log
+        led_strip
 )

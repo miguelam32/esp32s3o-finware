@@ -1,26 +1,30 @@
 /*
  * main.c
  * ESP32-S3 N16R8 (ESP-IDF v6.0.3) — Hopping TX con 2x nRF24L01
+ *                       + JAMMER de portadora continua
  *
  *   NRF2 -> SPI2 (bus propio)   canales   0..62   tarea en núcleo 0
  *   NRF3 -> SPI3 (bus propio)   canales  63..125  tarea en núcleo 1
  *   (NRF1 está muerto: no se usa)
  *
- * Cómo va en paralelo de verdad:
- *   - Cada radio tiene SU bus SPI (no se pelean) y SU tarea en SU núcleo.
- *   - Un gptimer de hardware (1 MHz) dispara cada DWELL_US y despierta a las
- *     dos tareas en el mismo instante. El ISR no toca SPI, solo avisa.
- *   - Las dos tareas hacen en paralelo: RF_CH -> payload -> pulso de CE.
+ * Dos modos de operación, conmutables por consola:
+ *   HOP  (default al flashear, "jam off") : RF_CH -> payload -> pulso de CE
+ *   JAM  ("jam on", arranca activo)       : RF_CH -> CE alto sostenido (carrier)
  *
- * LED WS2812 (GPIO48), testigo de estado:
- *   - Al arrancar: autotest rojo -> verde -> azul (si no lo ves, es el pin).
- *   - ARCOÍRIS 5 Hz : los 2 NRF presentes Y sus contadores de paquetes suben.
- *   - ROJO fijo     : falta algún NRF (no responde por SPI).
- *   - ÁMBAR fijo    : están los 2 pero algún contador no avanza.
+ * El jammer NO toca la lógica de hop: reutiliza la misma hop_table,
+ * el mismo gptimer y las mismas tareas. Solo cambia qué se ejecuta
+ * dentro del tick.
  *
- * Dependencia: idf.py add-dependency "espressif/led_strip^2.5.5"
- * main/CMakeLists.txt: si se queja de driver/gptimer.h agrega
- *   esp_driver_gptimer (y esp_driver_spi, esp_driver_gpio) a REQUIRES.
+ * Comandos por el monitor serie (115200):
+ *   jam [on|off]   portadora continua en ambos NRF
+ *   full           barre TODOS los canales del bloque (ignora blacklist)
+ *   help | ?       ayuda
+ *
+ * LED WS2812 (GPIO48):
+ *   ARCOÍRIS : modo HOP, los 2 NRF transmitiendo
+ *   VERDE    : modo JAM activo
+ *   ROJO     : falta algún NRF
+ *   ÁMBAR    : presentes pero sin tráfico
  */
 
 #include <stdio.h>
@@ -32,6 +36,7 @@
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "driver/gptimer.h"
+#include "driver/uart.h"
 #include "esp_log.h"
 #include "rom/ets_sys.h"
 #include "led_strip.h"
@@ -84,6 +89,10 @@ static led_strip_handle_t led;
 #define REESCANEO_MS          5000
 #define STATUS_MS             2000
 
+// ---------- Jammer (portadora continua) ----------
+#define RF_CONT_WAVE_BIT  0x80        // bit 7 de RF_SETUP
+#define RF_PLL_LOCK_BIT   0x10        // bit 4 de RF_SETUP
+
 typedef struct {
     const char *nombre;
     uint8_t numero;                 // 2 o 3: define la dirección (0xE0 + numero)
@@ -130,6 +139,10 @@ static radio_t radios[NUM_RADIOS] = {
 static EventGroupHandle_t eg;
 static volatile bool g_pausa = false;
 static gptimer_handle_t dwell_timer;
+
+// Estado del jammer
+static volatile bool g_jammer   = true;    // arranca en modo jammer
+static volatile bool g_jam_full = false;   // true = ignora blacklist, barre todo el bloque
 
 // ---------- SPI de bajo nivel ----------
 // Transacciones de <=4 bytes usan TXDATA/RXDATA: sin buffers ni DMA, lo más rápido.
@@ -292,7 +305,100 @@ static bool nrf_presente(radio_t *r) {
     return r->presente;
 }
 
-// ---------- Un salto: RF_CH -> payload -> pulso de CE ----------
+// ============================================================================
+//  JAMMER — portadora continua
+// ============================================================================
+// Reutiliza hop_table, gptimer y las tareas: solo cambia qué se hace en el
+// tick. Nada de la lógica de hop se toca.
+//
+// Regla del PLL (el bug clásico): hay que bajar CE ANTES de escribir RF_CH y
+// subirlo DESPUÉS. Si cambiás el canal con el carrier activo y CE alto, el
+// PLL se desengancha y el carrier se congela tras el primer salto.
+// ----------------------------------------------------------------------------
+
+// Un salto en modo jammer: cambia de canal manteniendo el carrier arriba.
+static inline void jam_hop(radio_t *r) {
+    r->hop_index++;
+    if (r->hop_index >= r->hop_count) {
+        r->hop_index = 0;
+        r->vueltas++;
+        barajar(r);                     // nuevo orden cada vuelta
+    }
+    uint8_t canal = r->hop_table[r->hop_index];
+    r->canal_actual = canal;
+
+    gpio_set_level(r->ce_pin, 0);                       // 1. CE abajo
+    nrf_write_reg(r->spi, NRF_RF_CH, canal);            // 2. canal nuevo
+    gpio_set_level(r->ce_pin, 1);                       // 3. carrier en el canal nuevo
+
+    r->packet_counter++;
+}
+
+// Entra en modo carrier: CONT_WAVE + PLL_LOCK, CE alto sostenido.
+static void jam_enter(radio_t *r) {
+    if (!r->presente) return;
+
+    gpio_set_level(r->ce_pin, 0);
+
+    nrf_send_cmd(r->spi, CMD_FLUSH_TX);
+    nrf_write_reg(r->spi, NRF_EN_AA, 0x00);
+    nrf_write_reg(r->spi, NRF_CONFIG, CONFIG_MODO_TX);            // PTX
+    nrf_write_reg(r->spi, NRF_RF_SETUP,
+                  (uint8_t)(RF_SETUP_VALOR | RF_CONT_WAVE_BIT | RF_PLL_LOCK_BIT));
+
+    // Tabla de canales: con "full" se ignora la blacklist y se barre todo.
+    if (g_jam_full) {
+        for (int i = 0; i < CHANNELS_PER_BLOQUE; i++) r->libres[i] = r->base_channel + i;
+        r->hop_count = CHANNELS_PER_BLOQUE;
+        r->hop_index = 0;
+        r->vueltas = 0;
+        barajar(r);
+    } else {
+        generar_hop_table(r);
+    }
+
+    r->canal_actual = r->hop_table[0];
+    nrf_write_reg(r->spi, NRF_RF_CH, r->canal_actual);
+    gpio_set_level(r->ce_pin, 1);                                 // carrier arriba
+}
+
+// Vuelve a modo hopping TX.
+static void jam_exit(radio_t *r) {
+    if (!r->presente) return;
+
+    gpio_set_level(r->ce_pin, 0);
+    nrf_write_reg(r->spi, NRF_RF_SETUP, RF_SETUP_VALOR);          // fuera CONT_WAVE
+    nrf_send_cmd(r->spi, CMD_FLUSH_TX);
+    nrf_write_reg(r->spi, NRF_CONFIG, CONFIG_MODO_TX);
+    generar_hop_table(r);
+}
+
+// Cambia el modo en ambos radios.
+static void jam_set(bool on) {
+    if (on == g_jammer) return;
+    g_jammer = on;
+    for (int i = 0; i < NUM_RADIOS; i++) {
+        if (!radios[i].presente) continue;
+        if (on) jam_enter(&radios[i]);
+        else    jam_exit(&radios[i]);
+    }
+    ESP_LOGW(TAG, ">>> JAMMER %s%s", on ? "ON" : "OFF",
+             (on && g_jam_full) ? " (barrido completo)" : "");
+}
+
+// Fuerza la reconstrucción de las tablas sin cambiar de modo (para "full").
+static void jam_refresh(void) {
+    if (!g_jammer) return;
+    for (int i = 0; i < NUM_RADIOS; i++) {
+        if (radios[i].presente) jam_enter(&radios[i]);
+    }
+}
+
+// ============================================================================
+//  HOPPING TX (intacto)
+// ============================================================================
+
+// Un salto: RF_CH -> payload -> pulso de CE
 static inline void hacer_hop(radio_t *r) {
     r->hop_index++;
     if (r->hop_index >= r->hop_count) {
@@ -349,7 +455,10 @@ static void radio_task(void *arg) {
             continue;
         }
         if (n > 1) r->perdidos += (n - 1);
-        hacer_hop(r);
+
+        // ---- único cambio respecto al hopping puro ----
+        if (g_jammer) jam_hop(r);
+        else          hacer_hop(r);
     }
 }
 
@@ -368,6 +477,8 @@ static void tarea_reescaneo(void *arg) {
             ets_delay_us(500);   // deja salir el último paquete en vuelo
             for (int i = 0; i < NUM_RADIOS; i++) if (radios[i].presente) escanear_bloque(&radios[i]);
             for (int i = 0; i < NUM_RADIOS; i++) if (radios[i].presente) generar_hop_table(&radios[i]);
+            // si seguimos en jammer, hay que volver a levantar el carrier
+            if (g_jammer) jam_refresh();
         } else {
             ESP_LOGW(TAG, "reescaneo cancelado: un radio no pauso a tiempo");
         }
@@ -395,15 +506,64 @@ static void iniciar_gptimer(void) {
     ESP_ERROR_CHECK(gptimer_start(dwell_timer));
 }
 
+// ---------- Consola ----------
+static void procesar_comando(const char *line) {
+    char cmd[32];
+    if (sscanf(line, "%31s", cmd) != 1) return;
+
+    if (!strcmp(cmd, "jam")) {
+        if (strstr(line, "on"))       jam_set(true);
+        else if (strstr(line, "off")) jam_set(false);
+        else                          jam_set(!g_jammer);
+    } else if (!strcmp(cmd, "full")) {
+        g_jam_full = !g_jam_full;
+        printf("barrido completo: %s\n", g_jam_full ? "SI (ignora blacklist)" : "NO (solo canales libres)");
+        jam_refresh();
+    } else if (!strcmp(cmd, "help") || !strcmp(cmd, "?")) {
+        printf("\n--- comandos ---\n"
+               "  jam [on|off]   portadora continua en ambos NRF\n"
+               "  full           barre TODOS los canales del bloque\n"
+               "  status         estado\n\n");
+    } else {
+        printf("desconocido: %s  (escribi 'help')\n", cmd);
+    }
+    printf("nrf> ");
+    fflush(stdout);
+}
+
+static void consola_task(void *arg) {
+    char line[64];
+    int n = 0;
+    uint8_t ch;
+    while (1) {
+        int len = uart_read_bytes(CONFIG_ESP_CONSOLE_UART_NUM, &ch, 1, pdMS_TO_TICKS(30));
+        if (len <= 0) continue;
+        if (ch == '\r' || ch == '\n') {
+            if (n > 0) {
+                line[n] = 0;
+                procesar_comando(line);
+                n = 0;
+            } else {
+                printf("nrf> ");
+                fflush(stdout);
+            }
+        } else if (n < (int)sizeof(line) - 1) {
+            line[n++] = (char)ch;
+        }
+    }
+}
+
 // ---------- Monitor serial ----------
 #define C_VERDE  "\033[32m"
 #define C_ROJO   "\033[31m"
 #define C_AMAR   "\033[33m"
+#define C_CYAN   "\033[36m"
 #define C_NEG    "\033[1m"
 #define C_RESET  "\033[0m"
 
 static void mostrar_estado(uint32_t t_seg, uint32_t prev[NUM_RADIOS]) {
-    printf("\n" C_NEG "──── NRF24 TX hopping · t=%lus ────" C_RESET "\n", (unsigned long)t_seg);
+    printf("\n" C_NEG "──── NRF24 %s · t=%lus ────" C_RESET "\n",
+           g_jammer ? "JAMMER" : "TX hop", (unsigned long)t_seg);
     for (int i = 0; i < NUM_RADIOS; i++) {
         radio_t *r = &radios[i];
         uint32_t ahora = r->packet_counter;
@@ -418,9 +578,10 @@ static void mostrar_estado(uint32_t t_seg, uint32_t prev[NUM_RADIOS]) {
             printf("%s [SPI%d CSN%-2d CE%-2d] " C_AMAR "▲ SIN PAQUETES" C_RESET "  pkts=%lu\n",
                    r->nombre, bus, (int)r->csn_pin, (int)r->ce_pin, (unsigned long)ahora);
         } else {
-            printf("%s [SPI%d CSN%-2d CE%-2d] " C_VERDE "● TX" C_RESET
+            printf("%s [SPI%d CSN%-2d CE%-2d] " C_VERDE "● %s" C_RESET
                    "  pkts=%-9lu %5lu/s  canal=%3u  libres=%2u/%d  vueltas=%lu  perdidos=%lu  flush=%lu\n",
                    r->nombre, bus, (int)r->csn_pin, (int)r->ce_pin,
+                   g_jammer ? "CARRIER" : "TX",
                    (unsigned long)ahora, (unsigned long)pps,
                    (unsigned)r->canal_actual, (unsigned)r->hop_count, CHANNELS_PER_BLOQUE,
                    (unsigned long)r->vueltas, (unsigned long)r->perdidos, (unsigned long)r->flushes);
@@ -484,15 +645,17 @@ static void led_task(void *arg) {
             prev[i] = ahora;
         }
 
-        if (todos_presentes && todos_tx) {
+        if (g_jammer) {
+            led_set(0, LED_BRILLO, 0);                        // VERDE: jammer activo
+        } else if (todos_presentes && todos_tx) {
             uint8_t r, g, b;
             hsv_to_rgb(hue, LED_BRILLO, &r, &g, &b);
             led_set(r, g, b);
             hue = (hue + LED_HUE_STEP) % 360;
         } else if (!todos_presentes) {
-            led_set(LED_BRILLO, 0, 0);                    // rojo: falta un NRF
+            led_set(LED_BRILLO, 0, 0);                        // rojo: falta un NRF
         } else {
-            led_set(LED_BRILLO, LED_BRILLO / 2, 0);       // ámbar: presentes pero sin tráfico
+            led_set(LED_BRILLO, LED_BRILLO / 2, 0);           // ámbar: presentes pero sin tráfico
         }
         vTaskDelay(pdMS_TO_TICKS(LED_PERIOD_MS));
     }
@@ -524,6 +687,7 @@ void app_main(void) {
     for (int i = 0; i < NUM_RADIOS; i++) if (radios[i].presente) generar_hop_table(&radios[i]);
 
     xTaskCreate(led_task, "led_task", 2048, NULL, 3, NULL);
+    xTaskCreate(consola_task, "consola", 3072, NULL, 2, NULL);
 
     if (activos > 0) {
         for (int i = 0; i < NUM_RADIOS; i++) {
@@ -533,10 +697,20 @@ void app_main(void) {
         }
         iniciar_gptimer();
         xTaskCreate(tarea_reescaneo, "reescaneo", 4096, NULL, 5, NULL);
-        ESP_LOGI(TAG, "%d radio(s) activos · dwell=%dus · SPI=%dMHz · barrido de los %d canales cada %.1f ms",
-                 activos, DWELL_US, SPI_HZ / 1000000, NUM_RADIOS * CHANNELS_PER_BLOQUE,
+
+        // ---- arranca en modo jammer si así está configurado ----
+        if (g_jammer) jam_refresh();
+
+        ESP_LOGI(TAG, "%d radio(s) activos · dwell=%dus · SPI=%dMHz · modo=%s",
+                 activos, DWELL_US, SPI_HZ / 1000000, g_jammer ? "JAMMER" : "HOPPING TX");
+        ESP_LOGI(TAG, "barrido de los %d canales cada %.1f ms",
+                 NUM_RADIOS * CHANNELS_PER_BLOQUE,
                  (CHANNELS_PER_BLOQUE * DWELL_US) / 1000.0f);
     }
+
+    printf("\n" C_CYAN "  jam [on|off]  portadora continua   |   full  barrido completo   |   help\n" C_RESET);
+    printf("nrf> ");
+    fflush(stdout);
 
     uint32_t prev[NUM_RADIOS] = { 0 };
     uint32_t t_seg = 0;
@@ -546,4 +720,3 @@ void app_main(void) {
         mostrar_estado(t_seg, prev);
     }
 }
-
