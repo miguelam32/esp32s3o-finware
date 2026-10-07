@@ -1,19 +1,8 @@
 # =============================================================================
-#  sdkconfig.defaults · ESP32-S3 N16R8 · ESP-IDF 6.0.3
-#  Modulo: 16 MB flash QUAD + 8 MB PSRAM OCTAL (embebida)
-#  Radios: Wi-Fi del S3 (solo ENVIAR datos) + 2x NRF24L01 por SPI (solo enviar)
-#  Meta: maximo rendimiento ESTABLE. Nada experimental.
-#
-#  Basado en el ejemplo oficial examples/wifi/iperf de IDF v6.0.3 (la config
-#  de Espressif para sacar el maximo throughput), adaptado a TX-only + PSRAM.
-#
-#  - Va en la RAIZ del repo, junto al CMakeLists.txt.
-#  - Necesita partitions.csv en la misma carpeta.
-#  - Pines: GPIO35, 36 y 37 los usa la PSRAM octal. No los uses para CS/CE/IRQ
-#    de los NRF24.
-#  - Importante: si cambias este archivo, borra sdkconfig y vuelve a correr
-#    `idf.py set-target esp32s3`; si no, el sdkconfig viejo manda sobre los
-#    defaults.
+#  sdkconfig.defaults.120mhz · ESP32-S3 N16R8 · ESP-IDF 6.0.3
+#  PRUEBA: PSRAM a 120 MHz DDR (experimental). Mismo archivo base, solo
+#  cambia el bloque de PSRAM. Si el chip no bootea o se calienta y falla,
+#  vuelve al sdkconfig.defaults original (80 MHz).
 # =============================================================================
 
 CONFIG_IDF_TARGET="esp32s3"
@@ -21,163 +10,73 @@ CONFIG_IDF_TARGET="esp32s3"
 # --- CPU y RTOS --------------------------------------------------------------
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_FREERTOS_HZ=1000
-# Dual core explicito (es el default, lo dejo escrito para que se note).
-# CONFIG_FREERTOS_UNICORE is not set
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
-# Funciones de FreeRTOS en IRAM: menos cache-miss al cambiar de tarea. El
-# ejemplo iperf de Espressif lo usa, y SPI_MASTER_IN_IRAM de abajo lo exige.
 CONFIG_FREERTOS_IN_IRAM=y
 
 # --- SPI para los 2 NRF24L01 --------------------------------------------------
-# Funciones de transmision del driver SPI maestro en IRAM: evita cache-miss
-# (y por ende jitter) entre transacciones hacia los NRF24. Depende de
-# FREERTOS_IN_IRAM (ya activo arriba).
 CONFIG_SPI_MASTER_IN_IRAM=y
-# La ISR del SPI maestro tambien en IRAM. Es el default, lo dejo explicito.
 CONFIG_SPI_MASTER_ISR_IN_IRAM=y
-# CONFIG_GPIO_ISR_IRAM_SAFE: lo quite a proposito. Servia para que el IRQ del
-# NRF24 sobreviviera a una escritura a flash con el cache apagado, pero con
-# XIP desde PSRAM (abajo) el cache NO se apaga en operaciones de flash, asi
-# que ya no hace falta y solo te gasta IRAM. Si algun dia ves IRQ perdidos
-# durante escrituras a NVS, activalo.
 
 # --- Compilador --------------------------------------------------------------
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 
 # --- Flash: 16 MB, QUAD --------------------------------------------------------
-# La flash de este modulo es quad. NO actives ESPTOOLPY_OCT_FLASH (eso es para
-# los modulos N16R8V / N32R16V con flash octal).
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
-# Si el modulo no arranca en QIO, cambia a DIO (CONFIG_ESPTOOLPY_FLASHMODE_DIO=y)
 
-# --- PSRAM: OCTAL 8 MB a 80 MHz --------------------------------------------------
-# SPIRAM_MODE_OCT es lo que le dice al S3 que la PSRAM es octal. Sin esta
-# linea la PSRAM no inicializa y el arranque truena.
-# (120 MHz es experimental y falla con cambios de temperatura: no se usa)
+# --- PSRAM: OCTAL 8 MB a 120 MHz (EXPERIMENTAL) --------------------------------
+# CAMBIO respecto al original: SPEED_80M -> SPEED_120M.
+# Tu chip es rev v0.2 + PSRAM AP_3v3, que es la combinación candidata para
+# este modo, pero el flash (Boya quad) no está confirmado como compatible
+# con la combinación exacta que exige 120 MHz. Si el bootloader no arranca
+# o se cuelga justo después del log de flash, es que tu combo no califica.
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
-CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_SPEED_120M=y
 CONFIG_SPIRAM_USE_MALLOC=y
-# malloc() menor a 16 KB se queda en RAM interna; lo grande va a PSRAM.
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
-# Reserva interna para DMA y stacks de tareas (las tareas de los NRF24 salen de
-# aqui). Es el default, lo dejo explicito para que no lo bajes sin querer.
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
-# Los buffers de Wi-Fi/lwIP NO se mandan a PSRAM (SPIRAM_TRY_ALLOCATE_WIFI_LWIP
-# queda apagado): en RAM interna son mas rapidos y no hay latencia de cache.
-# Sin test de memoria al arrancar (~1 s por cada 4 MB)
 # CONFIG_SPIRAM_MEMTEST is not set
 
 # --- Caches ----------------------------------------------------------------------
 CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
 CONFIG_ESP32S3_INSTRUCTION_CACHE_LINE_32B=y
-# ICACHE_WRAP: el ejemplo iperf lo prende, pero en el Kconfig de 6.0.3 esta
-# marcado con TODO y "depende de condiciones complejas". Tu codigo corre
-# desde PSRAM (XIP), combinacion que ese ejemplo no cubre. Lo dejo apagado
-# por estabilidad.
-#
-# Cache de datos 64 KB / linea 64 B: ayuda con copias grandes en PSRAM.
-# COSTO REAL (dice el Kconfig): con 32 KB en vez de 64 KB, esos 32 KB extra
-# pasan al heap interno. O sea, 64 KB te quita 32 KB de DRAM. Si el heap
-# interno te queda justo, baja a:
-#   CONFIG_ESP32S3_DATA_CACHE_32KB=y + CONFIG_ESP32S3_DATA_CACHE_LINE_32B=y
 CONFIG_ESP32S3_DATA_CACHE_64KB=y
 CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
 
 # --- XIP desde PSRAM -------------------------------------------------------------
-# Codigo y rodata corren desde PSRAM y el cache no se apaga en escrituras a
-# flash. XIP ya activa las otras dos; las dejo explicitas por claridad.
 CONFIG_SPIRAM_XIP_FROM_PSRAM=y
 CONFIG_SPIRAM_FETCH_INSTRUCTIONS=y
 CONFIG_SPIRAM_RODATA=y
 
 # --- Wi-Fi: modo TX-only a tope ----------------------------------------------------
-# Funciones calientes del driver en IRAM (iperf las usa).
 CONFIG_ESP_WIFI_IRAM_OPT=y
 CONFIG_ESP_WIFI_RX_IRAM_OPT=y
-# Extra: mas funciones del driver en IRAM (~5 KB). Default apagado en el S3.
 CONFIG_ESP_WIFI_EXTRA_IRAM_OPT=y
-
-# Como SOLO mandas datos, el peso va a TX; RX se queda moderado (solo llegan
-# ACKs y poco mas).
-# Buffers TX DINAMICOS (el default). Ojo: ESP_WIFI_STATIC_TX_BUFFER_NUM solo
-# aplica con TX estatico y se ignora aqui; el valor que cuenta es el dinamico.
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER=y
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=64
-# Agregacion A-MPDU (nombre correcto del simbolo: termina en _ENABLED).
 CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=y
-# Ventana Block Ack de TX al maximo del S3 (rango 2-32). Es lo que mas sube el
-# throughput de envio, y el ejemplo iperf usa 32.
 CONFIG_ESP_WIFI_TX_BA_WIN=32
 CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=y
-# El Kconfig pide RX estaticos >= ventana RX: 16 y 16, consistentes.
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_RX_BA_WIN=16
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=64
-# Subir DYNAMIC_TX_BUFFER_NUM a 128 (maximo) solo si mides drops por UDP a
-# tope Y te sobra heap interno. Cada buffer pesa ~1.6 KB.
-
-# Potencia: 20 dBm es el maximo del silicio. En runtime ademas hace falta
-# esp_wifi_set_max_tx_power(80) despues de esp_wifi_start().
 CONFIG_ESP_PHY_MAX_WIFI_TX_POWER=20
 
 # --- lwIP --------------------------------------------------------------------------
 CONFIG_LWIP_IRAM_OPTIMIZATION=y
-# Tarea tcpip a prioridad 23 (como en iperf): menos espera entre tu send() y
-# el driver Wi-Fi.
 CONFIG_LWIP_TCPIP_TASK_PRIO=23
-# Si usas TCP: buffer de envio y ventana al maximo sin window-scaling.
-# Si usas UDP estos dos casi no pesan; lo que cuenta es DYNAMIC_TX_BUFFER_NUM.
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65535
 CONFIG_LWIP_TCP_WND_DEFAULT=65535
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=64
 CONFIG_LWIP_UDP_RECVMBOX_SIZE=64
 CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
 
-# OJO con la RAM interna: cache de datos 64 KB + buffers Wi-Fi + 2 SPI + todo
-# en IRAM la aprietan. Primer sintoma: heap_caps_malloc fallando para buffers
-# internos. Recortes en este orden: DATA_CACHE a 32 KB, luego
-# DYNAMIC_TX_BUFFER_NUM 64 -> 48.
-
 # --- Particiones -----------------------------------------------------------------
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # --- Logs al minimo -----------------------------------------------------------------
-# Menos texto por UART = mas ciclos libres para atender los NRF24.
 CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
 CONFIG_LOG_DEFAULT_LEVEL_WARN=y
-
-# --- Lo que NO esta, a proposito ---------------------------------------------------
-# - Brownout detector: se queda de fabrica. Wi-Fi a 20 dBm + 2 NRF24 meten
-#   picos de corriente; apagarlo no da rendimiento, solo quita la alarma.
-# - Watchdogs: el ejemplo iperf los apaga porque es benchmark. Aqui se quedan
-#   prendidos. Si tus tareas de los NRF24 hacen polling sin ceder CPU, mete un
-#   vTaskDelay(1) o el idle task se muere de hambre y el TWDT te resetea.
-# - ESP_PHY_DISABLE_PLL_TRACK: Espressif lo marca "experimental". El PLL track
-#   es lo que adapta el PHY a los cambios de temperatura; quitarlo es pedir
-#   problemas cuando el chip se calienta.
-# - FREERTOS_SMP: kernel beta de Espressif. No hace falta: repartir tareas
-#   entre cores se hace con xTaskCreatePinnedToCore en el FreeRTOS normal.
-# - Deep sleep / RTC_CLK_SRC: no hay simbolos CONFIG_ESP32S3_DEEP_SLEEP ni
-#   CONFIG_ESP32S3_RTC_CLK_SRC; y deep sleep no se usa aqui.
-
-# =============================================================================
-#  NOTAS - esto NO es sdkconfig, va en tu codigo:
-#  1. Cada NRF24 en su propia tarea con xTaskCreatePinnedToCore(..., core).
-#  2. PA_MAX del NRF24: registro RF_SETUP, RF_PWR=11 (0 dBm, tope del IC
-#     plano). Con modulos +PA+LNA el tope lo pone el modulo.
-#  3. Despues de esp_wifi_start(): esp_wifi_set_max_tx_power(80) y
-#     esp_wifi_set_ps(WIFI_PS_NONE), para que el modem-sleep no meta latencia
-#     justo cuando un NRF24 tiene un paquete esperando.
-#  4. Canal Wi-Fi fijo (1, 6 u 11) y los NRF24 lejos de el: frecuencia del
-#     NRF = 2400 + canal MHz.
-#  5. SPI de los NRF24 a <=10 MHz, con buffers MALLOC_CAP_DMA en RAM interna
-#     (el DMA contra PSRAM rinde muy poco). La ISR del IRQ solo debe avisar a
-#     la tarea (xTaskNotifyFromISR); nada de SPI adentro de la ISR.
-#  6. Hardware: capacitor >=100 uF pegado a cada NRF24 y las 3 antenas de
-#     2.4 GHz separadas fisicamente.
-# =============================================================================
-
