@@ -87,7 +87,7 @@ static led_strip_handle_t led;
 /* El PLL del nRF tarda 130 us en enganchar: 140 us es el piso real.
  * Pasados ~450 us la vuelta completa supera los 17 ms y el BT se recupera
  * entre visitas, asi que ahi deja de servir subir. */
-static const uint32_t dwell_ladder[] = { 140, 170, 200, 250, 320, 380, 450 };
+static const uint32_t dwell_ladder[] = { 180, 220, 260, 300, 360, 420, 480 };
 #define DWELL_STEPS      (sizeof(dwell_ladder) / sizeof(dwell_ladder[0]))
 #define DWELL_PERIOD_MS  10000
 
@@ -205,10 +205,19 @@ static void generar_tabla(radio_t *r) {
 }
 
 /* ================= portadora continua ================= */
+/* Spin de ciclos puro. NO uses ets_delay_us() aca: en FreeRTOS hace
+ * busy-wait contra el timer del sistema y dispara el task watchdog cuando
+ * el dwell baja de ~200us. */
+static inline void pll_settle(uint32_t us) {
+    if (!us) return;
+    volatile uint32_t n = (us * 240u) / 4u;   /* 240 MHz: ~4 ciclos por vuelta */
+    while (n--) { }
+}
+
 static void cw_up(radio_t *r, uint8_t ch) {
     ce_lo(r);                                       /* CE abajo primero */
     nrf_write_reg(r->spi, NRF_RF_CH, (uint8_t)(ch & 0x7F));
-    ets_delay_us(140);                              /* asentamiento del PLL */
+    pll_settle(140);                                /* asentamiento del PLL */
     ce_hi(r);                                       /* carrier en el canal */
 }
 
@@ -300,6 +309,10 @@ static void radio_task(void *arg) {
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         jam_hop(r);
+        /* Ceder la CPU de verdad. Sin esto el task watchdog de IDLE dispara
+         * cuando el dwell baja de ~200us: la tarea queda al 100% de CPU y
+         * el scheduler nunca llega a IDLE. */
+        vTaskDelay(0);
     }
 }
 
