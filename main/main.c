@@ -361,14 +361,20 @@ static void generar_jam_table(radio_t *r, bool respetar_blacklist) {
 
 // CE por registro directo: gpio_set_level() cuesta 2-5us de overhead, y a
 // 170us de dwell eso es ~2% del tiempo de aire tirado a la basura.
-#define OUT_W1TS   (*(volatile uint32_t *)0x3F4040008u)
-#define OUT_W1TC   (*(volatile uint32_t *)0x3F404000Cu)
+/* ESP32-S3: base GPIO = 0x60004000.  (0x3F4040000 es del S2 y NO cabe
+ * en 32 bits: el compilador la truncaba y caia en StoreProhibited.) */
+#define OUT_W1TS    (*(volatile uint32_t *)0x60004008u)   /* pines 0-31  */
+#define OUT_W1TC    (*(volatile uint32_t *)0x6000400Cu)
+#define OUT1_W1TS   (*(volatile uint32_t *)0x60004014u)   /* pines 32-45 */
+#define OUT1_W1TC   (*(volatile uint32_t *)0x60004018u)
 
 static inline void ce_hi(radio_t *r) {
-    OUT_W1TS = (1u << (uint32_t)r->ce_pin);
+    if (r->ce_pin < 32) OUT_W1TS  = (1u << (uint32_t)r->ce_pin);
+    else                OUT1_W1TS = (1u << ((uint32_t)r->ce_pin - 32));
 }
 static inline void ce_lo(radio_t *r) {
-    OUT_W1TC = (1u << (uint32_t)r->ce_pin);
+    if (r->ce_pin < 32) OUT_W1TC  = (1u << (uint32_t)r->ce_pin);
+    else                OUT1_W1TC = (1u << ((uint32_t)r->ce_pin - 32));
 }
 
 // Un salto en modo jammer: cambia de canal manteniendo el carrier arriba.
