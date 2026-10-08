@@ -84,7 +84,7 @@ static led_strip_handle_t led;
 #define NUM_RADIOS            2
 #define CHANNELS_PER_BLOQUE   63      // 126 canales / 2 radios
 #define MIN_CANALES_LIBRES    16      // si el escaneo deja menos, se usa el bloque completo
-#define DWELL_US              450     // ciclo del chip ~300us (130 settling + ~165 aire) => ~150us de margen
+#define DWELL_US              250     // ciclo del chip ~300us (130 settling + ~165 aire) => ~150us de margen
 #define PAYLOAD_LEN           32      // máximo del nRF24
 #define REESCANEO_MS          5000
 #define STATUS_MS             2000
@@ -92,6 +92,13 @@ static led_strip_handle_t led;
 // ---------- Jammer (portadora continua) ----------
 #define RF_CONT_WAVE_BIT  0x80        // bit 7 de RF_SETUP
 #define RF_PLL_LOCK_BIT   0x10        // bit 4 de RF_SETUP
+
+// Rango que de verdad usa BT/BLE: 2402-2480 MHz = canales nRF 2..80.
+// Fuera de ahi es desperdicio. El radio 3 barria 63..125 (2463..2525 MHz):
+// 45 de esos 63 canales no existen para BT ni BLE.
+#define JAM_CH_LO   2
+#define JAM_CH_HI   80
+#define JAM_CH_N    (JAM_CH_HI - JAM_CH_LO + 1)
 
 typedef struct {
     const char *nombre;
@@ -316,6 +323,41 @@ static bool nrf_presente(radio_t *r) {
 // PLL se desengancha y el carrier se congela tras el primer salto.
 // ----------------------------------------------------------------------------
 
+// ¿Está sucio este canal según el escaneo de CUALQUIERA de los dos radios?
+// Cada radio solo escanea su mitad, así que hay que consultar los dos.
+static bool jam_ch_sucio(int canal) {
+    for (int i = 0; i < NUM_RADIOS; i++) {
+        int idx = canal - radios[i].base_channel;
+        if (idx >= 0 && idx < CHANNELS_PER_BLOQUE && radios[i].blacklist[idx]) return true;
+    }
+    return false;
+}
+
+// Tabla del jammer: SOLO el rango útil 2..80, partido entre los dos radios.
+//   radio 0 (NRF2) -> 2..40       radio 1 (NRF3) -> 41..80
+// respetar_blacklist = true  -> salta los canales WiFi
+static void generar_jam_table(radio_t *r, bool respetar_blacklist) {
+    int idx = (int)(r - radios);
+    int por_radio = JAM_CH_N / NUM_RADIOS;              // 39
+    int lo = JAM_CH_LO + idx * por_radio;
+    int hi = lo + por_radio - 1;
+    if (idx == NUM_RADIOS - 1) hi = JAM_CH_HI;          // el último se lleva el resto
+
+    int n = 0;
+    for (int c = lo; c <= hi; c++) {
+        if (respetar_blacklist && jam_ch_sucio(c)) continue;
+        r->libres[n++] = (uint8_t)c;
+    }
+    if (n < 8) {          // casi todo sucio: mejor el rango completo que 4 canales
+        n = 0;
+        for (int c = lo; c <= hi; c++) r->libres[n++] = (uint8_t)c;
+    }
+    r->hop_count = (uint8_t)n;
+    r->hop_index = 0;
+    r->vueltas = 0;
+    barajar(r);
+}
+
 // Un salto en modo jammer: cambia de canal manteniendo el carrier arriba.
 static inline void jam_hop(radio_t *r) {
     r->hop_index++;
@@ -346,16 +388,10 @@ static void jam_enter(radio_t *r) {
     nrf_write_reg(r->spi, NRF_RF_SETUP,
                   (uint8_t)(RF_SETUP_VALOR | RF_CONT_WAVE_BIT | RF_PLL_LOCK_BIT));
 
-    // Tabla de canales: con "full" se ignora la blacklist y se barre todo.
-    if (g_jam_full) {
-        for (int i = 0; i < CHANNELS_PER_BLOQUE; i++) r->libres[i] = r->base_channel + i;
-        r->hop_count = CHANNELS_PER_BLOQUE;
-        r->hop_index = 0;
-        r->vueltas = 0;
-        barajar(r);
-    } else {
-        generar_hop_table(r);
-    }
+    // Tabla del jammer: rango útil 2..80 partido entre los dos radios.
+    // g_jam_full = true  -> ignora blacklist, barre los 79 canales útiles
+    // g_jam_full = false -> salta los canales WiFi (donde el BT con AFH no vive)
+    generar_jam_table(r, !g_jam_full);
 
     r->canal_actual = r->hop_table[0];
     nrf_write_reg(r->spi, NRF_RF_CH, r->canal_actual);
