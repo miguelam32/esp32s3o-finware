@@ -306,13 +306,17 @@ static bool IRAM_ATTR on_alarm(gptimer_handle_t t,
 
 static void radio_task(void *arg) {
     radio_t *r = (radio_t *)arg;
+    uint32_t n = 0;
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         jam_hop(r);
-        /* Ceder la CPU de verdad. Sin esto el task watchdog de IDLE dispara
-         * cuando el dwell baja de ~200us: la tarea queda al 100% de CPU y
-         * el scheduler nunca llega a IDLE. */
-        vTaskDelay(0);
+        /* El busy-wait del PLL (~140us) satura el nucleo. Con el dwell bajo y
+         * la tarea a prioridad maxima, IDLE nunca corre y el task watchdog
+         * dispara. vTaskDelay(0) NO alcanza: la notificacion del timer deja la
+         * tarea Ready al instante y el scheduler la vuelve a elegir antes que
+         * IDLE. Cada 16 saltos bloqueamos 1 tick COMPLETO (1ms): ahi la tarea
+         * esta en Delayed y IDLE corre si o si. */
+        if ((++n & 15) == 0) vTaskDelay(1);
     }
 }
 
