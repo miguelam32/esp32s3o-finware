@@ -39,7 +39,7 @@
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "rom/ets_sys.h"
-#include "soc/gpio_struct.h"
+#include "hal/gpio_ll.h"
 #include "led_strip.h"
 
 static const char *TAG = "NRF24_2TX";
@@ -361,13 +361,14 @@ static void generar_jam_table(radio_t *r, bool respetar_blacklist) {
 
 // CE por registro directo: gpio_set_level() cuesta 2-5us de overhead, y a
 // 170us de dwell eso es ~2% del tiempo de aire tirado a la basura.
+#define OUT_W1TS   (*(volatile uint32_t *)0x3F4040088u)
+#define OUT_W1TC   (*(volatile uint32_t *)0x3F404008Cu)
+
 static inline void ce_hi(radio_t *r) {
-    if (r->ce_pin < 32) REG_WRITE(GPIO_OUT_W1TS_REG, (1u << (uint32_t)r->ce_pin));
-    else                REG_WRITE(GPIO_OUT1_W1TS_REG, (1u << ((uint32_t)r->ce_pin - 32)));
+    OUT_W1TS = (1u << (uint32_t)r->ce_pin);
 }
 static inline void ce_lo(radio_t *r) {
-    if (r->ce_pin < 32) REG_WRITE(GPIO_OUT_W1TC_REG, (1u << (uint32_t)r->ce_pin));
-    else                REG_WRITE(GPIO_OUT1_W1TC_REG, (1u << ((uint32_t)r->ce_pin - 32)));
+    OUT_W1TC = (1u << (uint32_t)r->ce_pin);
 }
 
 // Un salto en modo jammer: cambia de canal manteniendo el carrier arriba.
