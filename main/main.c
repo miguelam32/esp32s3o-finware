@@ -125,24 +125,21 @@ static gptimer_handle_t dwell_timer;
 static volatile uint32_t g_dwell = dwell_ladder[0];
 static volatile bool     g_flash = false;      /* destello de LED */
 
-/* ================= CE por registro directo =================
- * ESP32-S3: base GPIO = 0x60004000.
- *   OUT_W1TS  +0x08   OUT_W1TC  +0x0C   (pines 0-31)
- *   OUT1_W1TS +0x14   OUT1_W1TC +0x18   (pines 32-45)
- * gpio_set_level() cuesta 2-5 us; esto es 1 ciclo de bus.
- */
-#define OUT_W1TS    (*(volatile uint32_t *)0x60004008u)
-#define OUT_W1TC    (*(volatile uint32_t *)0x6000400Cu)
-#define OUT1_W1TS   (*(volatile uint32_t *)0x60004014u)
-#define OUT1_W1TC   (*(volatile uint32_t *)0x60004018u)
+/* CE por la API del driver. Las escrituras directas a 0x60004008/0x0C no
+ * las pudimos verificar en este chip: si apuntan a otro registro el CE nunca
+ * se mueve y el carrier queda clavado en un solo canal (no jamea nada).
+ * gpio_set_level() cuesta ~2-3us; a 180-480us de dwell eso es 1-2%. */
+#define GPIO_OUT_REG_A  (*(volatile uint32_t *)0x60004004u)   /* pines 0-31  */
+#define GPIO_OUT1_REG_A (*(volatile uint32_t *)0x60004010u)   /* pines 32-45 */
 
-static inline void ce_hi(radio_t *r) {
-    if (r->ce < 32) OUT_W1TS  = (1u << (uint32_t)r->ce);
-    else            OUT1_W1TS = (1u << ((uint32_t)r->ce - 32));
-}
-static inline void ce_lo(radio_t *r) {
-    if (r->ce < 32) OUT_W1TC  = (1u << (uint32_t)r->ce);
-    else            OUT1_W1TC = (1u << ((uint32_t)r->ce - 32));
+static inline void ce_hi(radio_t *r) { gpio_set_level(r->ce, 1); }
+static inline void ce_lo(radio_t *r) { gpio_set_level(r->ce, 0); }
+
+/* Lee el pin de vuelta: si esto da siempre lo mismo, el CE no togglea. */
+static inline int ce_state(radio_t *r) {
+    uint32_t v = (r->ce < 32) ? GPIO_OUT_REG_A : GPIO_OUT1_REG_A;
+    int bit = (r->ce < 32) ? (int)r->ce : (int)((uint32_t)r->ce - 32);
+    return (int)((v >> bit) & 1u);
 }
 
 /* ================= SPI (sin DMA: <=8 bytes va por TXDATA/RXDATA) ================= */
@@ -256,9 +253,9 @@ static void bus_init(spi_host_device_t host, gpio_num_t sck, gpio_num_t mosi, gp
     spi_bus_config_t buscfg = {
         .mosi_io_num = mosi, .miso_io_num = miso, .sclk_io_num = sck,
         .quadwp_io_num = -1, .quadhd_io_num = -1,
-        .max_transfer_sz = MAX_XFER,
+        .max_transfer_sz = 64,
     };
-    ESP_ERROR_CHECK(spi_bus_initialize(host, &buscfg, SPI_DMA_DISABLED));
+    ESP_ERROR_CHECK(spi_bus_initialize(host, &buscfg, SPI_DMA_CH_AUTO));
 }
 
 static bool radio_init(radio_t *r) {
@@ -308,17 +305,9 @@ static bool IRAM_ATTR on_alarm(gptimer_handle_t t,
 
 static void radio_task(void *arg) {
     radio_t *r = (radio_t *)arg;
-    uint32_t n = 0;
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         jam_hop(r);
-        /* El busy-wait del PLL (~140us) satura el nucleo. Con el dwell bajo y
-         * la tarea a prioridad maxima, IDLE nunca corre y el task watchdog
-         * dispara. vTaskDelay(0) NO alcanza: la notificacion del timer deja la
-         * tarea Ready al instante y el scheduler la vuelve a elegir antes que
-         * IDLE. Cada 16 saltos bloqueamos 1 tick COMPLETO (1ms): ahi la tarea
-         * esta en Delayed y IDLE corre si o si. */
-        if ((++n & 15) == 0) vTaskDelay(1);
     }
 }
 
@@ -450,17 +439,22 @@ void app_main(void) {
 
     /* log de estado: no acepta comandos, solo informa */
     uint32_t prev[NUM_RADIOS] = { 0 };
+    int64_t  tprev[NUM_RADIOS] = { 0 };
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(2000));
+        int64_t now = esp_timer_get_time();
         for (int i = 0; i < NUM_RADIOS; i++) {
             radio_t *r = &radios[i];
             if (!r->spi) continue;
-            uint32_t pps = (r->hops - prev[i]) / 2;
-            prev[i] = r->hops;
-            ESP_LOGI(TAG, "%s  %4lu saltos/s  canal=%2u  libres=%2u  vueltas=%lu  dwell=%lu",
-                     r->nombre, (unsigned long)pps, (unsigned)r->canal,
-                     (unsigned)r->order_len, (unsigned long)r->vueltas,
-                     (unsigned long)g_dwell);
+            uint32_t dh = r->hops - prev[i];
+            uint32_t us_hop = dh ? (uint32_t)((now - tprev[i]) / dh) : 0;
+            prev[i]  = r->hops;
+            tprev[i] = now;
+            ESP_LOGI(TAG, "%s %4lu saltos/s (%lu us/hop) canal=%2u libres=%2u vueltas=%lu dwell=%lu CE=%d",
+                     r->nombre, (unsigned long)(dh / 2), (unsigned long)us_hop,
+                     (unsigned)r->canal, (unsigned)r->order_len,
+                     (unsigned long)r->vueltas, (unsigned long)g_dwell,
+                     ce_state(r));
         }
     }
 }
