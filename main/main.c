@@ -215,10 +215,12 @@ static inline void pll_settle(uint32_t us) {
 }
 
 static void cw_up(radio_t *r, uint8_t ch) {
-    ce_lo(r);                                       /* CE abajo primero */
+    ce_lo(r);                                       /* corta el carrier */
     nrf_write_reg(r->spi, NRF_RF_CH, (uint8_t)(ch & 0x7F));
-    pll_settle(140);                                /* asentamiento del PLL */
-    ce_hi(r);                                       /* carrier en el canal */
+    ce_hi(r);                                       /* carrier arriba YA */
+    /* Los ~130us de asentamiento del PLL ocurren con el carrier ya radiando,
+     * durante el dwell. NO hay que esperarlos con CE abajo: eso le corta el
+     * tiempo de aire a ~25us por salto y el jammer deja de hacer nada. */
 }
 
 static void jam_enter(radio_t *r) {
