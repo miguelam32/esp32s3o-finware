@@ -39,6 +39,7 @@
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "rom/ets_sys.h"
+#include "soc/gpio_struct.h"
 #include "led_strip.h"
 
 static const char *TAG = "NRF24_2TX";
@@ -84,7 +85,7 @@ static led_strip_handle_t led;
 #define NUM_RADIOS            2
 #define CHANNELS_PER_BLOQUE   63      // 126 canales / 2 radios
 #define MIN_CANALES_LIBRES    16      // si el escaneo deja menos, se usa el bloque completo
-#define DWELL_US              250     // ciclo del chip ~300us (130 settling + ~165 aire) => ~150us de margen
+#define DWELL_US              170     // ciclo del chip ~300us (130 settling + ~165 aire) => ~150us de margen
 #define PAYLOAD_LEN           32      // máximo del nRF24
 #define REESCANEO_MS          5000
 #define STATUS_MS             2000
@@ -358,6 +359,17 @@ static void generar_jam_table(radio_t *r, bool respetar_blacklist) {
     barajar(r);
 }
 
+// CE por registro directo: gpio_set_level() cuesta 2-5us de overhead, y a
+// 170us de dwell eso es ~2% del tiempo de aire tirado a la basura.
+static inline void ce_hi(radio_t *r) {
+    if (r->ce_pin < 32) REG_WRITE(GPIO_OUT_W1TS_REG, (1u << (uint32_t)r->ce_pin));
+    else                REG_WRITE(GPIO_OUT1_W1TS_REG, (1u << ((uint32_t)r->ce_pin - 32)));
+}
+static inline void ce_lo(radio_t *r) {
+    if (r->ce_pin < 32) REG_WRITE(GPIO_OUT_W1TC_REG, (1u << (uint32_t)r->ce_pin));
+    else                REG_WRITE(GPIO_OUT1_W1TC_REG, (1u << ((uint32_t)r->ce_pin - 32)));
+}
+
 // Un salto en modo jammer: cambia de canal manteniendo el carrier arriba.
 static inline void jam_hop(radio_t *r) {
     r->hop_index++;
@@ -369,9 +381,9 @@ static inline void jam_hop(radio_t *r) {
     uint8_t canal = r->hop_table[r->hop_index];
     r->canal_actual = canal;
 
-    gpio_set_level(r->ce_pin, 0);                       // 1. CE abajo
+    ce_lo(r);                                           // 1. CE abajo
     nrf_write_reg(r->spi, NRF_RF_CH, canal);            // 2. canal nuevo
-    gpio_set_level(r->ce_pin, 1);                       // 3. carrier en el canal nuevo
+    ce_hi(r);                                           // 3. carrier en el canal nuevo
 
     r->packet_counter++;
 }
@@ -734,7 +746,7 @@ void app_main(void) {
         for (int i = 0; i < NUM_RADIOS; i++) {
             if (!radios[i].presente) continue;
             xTaskCreatePinnedToCore(radio_task, radios[i].nombre, 3072, &radios[i],
-                                    configMAX_PRIORITIES - 5, &radios[i].task, radios[i].core);
+                                    configMAX_PRIORITIES - 1, &radios[i].task, radios[i].core);
         }
         iniciar_gptimer();
         xTaskCreate(tarea_reescaneo, "reescaneo", 4096, NULL, 5, NULL);
