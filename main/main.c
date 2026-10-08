@@ -11,7 +11,7 @@
  * verdad usa Bluetooth (2402-2480 MHz = canales nRF 2..80), partido entre los
  * dos radios para cubrirlo entero.
  *
- * Dwell automático: cada 10 s sube un peldaño, de 150 us a 220 us. Cuando
+ * Dwell automático: cada 5 s sube un peldaño, de 150 us a 170 us. Cuando
  * llega al techo vuelve al piso. Así se prueban las dos estrategias a la vez:
  *   - dwell bajo  = mucha frecuencia de visita, blips cortos
  *   - dwell alto  = pocas visitas pero cada una corrompe paquetes de verdad
@@ -88,11 +88,11 @@ static led_strip_handle_t led;
  * cambiar de canal. 150 us = 130 de settle + 20 de margen. Por debajo de eso
  * el carrier no se estabiliza. El overhead de esta app es ~0 (el us/hop
  * medido coincide con el dwell), asi que este es el unico limite.
- * Techo 220 us: por encima la vuelta completa pasa de 8.6 ms y el duty por
- * canal cae. 180 y 220 dieron silencio confirmado. */
-static const uint32_t dwell_ladder[] = { 150, 160, 170, 180, 190, 200, 210, 220 };
+ * Techo 170 us: por encima de eso la vuelta completa pasa de 6.6 ms y el duty
+ * por canal cae sin ganar nada. 150-170 dieron silencio confirmado. */
+static const uint32_t dwell_ladder[] = { 150, 160, 170 };
 #define DWELL_STEPS      (sizeof(dwell_ladder) / sizeof(dwell_ladder[0]))
-#define DWELL_PERIOD_MS  10000
+#define DWELL_PERIOD_MS  5000
 
 typedef struct {
     const char       *nombre;
