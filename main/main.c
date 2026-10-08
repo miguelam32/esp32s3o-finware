@@ -531,6 +531,10 @@ static void procesar_comando(const char *line) {
     fflush(stdout);
 }
 
+static void uart_consola_init(void) {
+    uart_driver_install(CONFIG_ESP_CONSOLE_UART_NUM, 256, 0, 0, NULL, 0);
+}
+
 static void consola_task(void *arg) {
     char line[64];
     int n = 0;
@@ -687,6 +691,7 @@ void app_main(void) {
     for (int i = 0; i < NUM_RADIOS; i++) if (radios[i].presente) generar_hop_table(&radios[i]);
 
     xTaskCreate(led_task, "led_task", 2048, NULL, 3, NULL);
+    uart_consola_init();
     xTaskCreate(consola_task, "consola", 3072, NULL, 2, NULL);
 
     if (activos > 0) {
