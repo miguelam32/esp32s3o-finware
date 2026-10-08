@@ -361,8 +361,8 @@ static void generar_jam_table(radio_t *r, bool respetar_blacklist) {
 
 // CE por registro directo: gpio_set_level() cuesta 2-5us de overhead, y a
 // 170us de dwell eso es ~2% del tiempo de aire tirado a la basura.
-#define OUT_W1TS   (*(volatile uint32_t *)0x3F4040088u)
-#define OUT_W1TC   (*(volatile uint32_t *)0x3F404008Cu)
+#define OUT_W1TS   (*(volatile uint32_t *)0x3F4040008u)
+#define OUT_W1TC   (*(volatile uint32_t *)0x3F404000Cu)
 
 static inline void ce_hi(radio_t *r) {
     OUT_W1TS = (1u << (uint32_t)r->ce_pin);
