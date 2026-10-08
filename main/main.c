@@ -142,7 +142,7 @@ static gptimer_handle_t dwell_timer;
 
 // Estado del jammer
 static volatile bool g_jammer   = true;    // arranca en modo jammer
-static volatile bool g_jam_full = false;   // true = ignora blacklist, barre todo el bloque
+static volatile bool g_jam_full = true;   // true = ignora blacklist, barre todo el bloque
 
 // ---------- SPI de bajo nivel ----------
 // Transacciones de <=4 bytes usan TXDATA/RXDATA: sin buffers ni DMA, lo más rápido.
