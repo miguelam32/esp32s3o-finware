@@ -1,15 +1,16 @@
 /*
  * main.c
- * ESP32-S3 N16R8 (ESP-IDF v6.0.3) — Jammer BT/BLE con 2x nRF24L01+ PA/LNA
+ * ESP32-S3 N16R8 (ESP-IDF v6.0.3) — Jammer BT/BLE con 3x nRF24L01+ PA/LNA
  *
- *   NRF2 -> SPI2 (bus propio)   canales  2..40   tarea en núcleo 0
- *   NRF3 -> SPI3 (bus propio)   canales 41..80   tarea en núcleo 1
+ *   NRF2 -> SPI2 (CS 9)   canales  2..27   tarea en núcleo 0
+ *   NRF1 -> SPI2 (CS 10)  canales 28..53   tarea en núcleo 0
+ *   NRF3 -> SPI3 (CS 21)  canales 54..80   tarea en núcleo 1
  *
  * Sin consola, sin comandos. Se enchufa y transmite.
  *
  * Modo: portadora continua (CONT_WAVE + PLL_LOCK) barriendo el rango que de
  * verdad usa Bluetooth (2402-2480 MHz = canales nRF 2..80), partido entre los
- * dos radios para cubrirlo entero.
+ * tres radios para cubrirlo entero.
  *
  * Dwell automático: cada 5 s sube un peldaño, de 150 us a 170 us. Cuando
  * llega al techo vuelve al piso. Así se prueban las dos estrategias a la vez:
@@ -77,7 +78,7 @@ static led_strip_handle_t led;
 #define MAX_XFER  8
 
 // ---------- Jammer ----------
-#define NUM_RADIOS  2
+#define NUM_RADIOS  3
 
 /* Rango útil de BT/BLE: 2402-2480 MHz. Fuera de aca es espectro desperdiciado. */
 #define JAM_CH_LO   2
@@ -114,10 +115,17 @@ typedef struct {
 } radio_t;
 
 static radio_t radios[NUM_RADIOS] = {
+    /* NRF2 y NRF1 comparten el bus SPI2 (SCK=12 MOSI=11 MISO=13) con CS
+     * distintos. Van en el MISMO nucleo a proposito: el lock del bus SPI2
+     * los serializa solo por scheduling, sin spinlock entre nucleos. */
     { .nombre = "NRF2", .host = SPI2_HOST,
       .ce = GPIO_NUM_5,  .cs = GPIO_NUM_9,  .sck = GPIO_NUM_12,
       .mosi = GPIO_NUM_11, .miso = GPIO_NUM_13,
       .seed = 0xA17E56u, .core = 0 },
+    { .nombre = "NRF1", .host = SPI2_HOST,
+      .ce = GPIO_NUM_4,  .cs = GPIO_NUM_10, .sck = GPIO_NUM_12,
+      .mosi = GPIO_NUM_11, .miso = GPIO_NUM_13,
+      .seed = 0xA17E55u, .core = 0 },
     { .nombre = "NRF3", .host = SPI3_HOST,
       .ce = GPIO_NUM_1,  .cs = GPIO_NUM_21, .sck = GPIO_NUM_18,
       .mosi = GPIO_NUM_8, .miso = GPIO_NUM_7,
@@ -187,8 +195,8 @@ static void barajar(radio_t *r) {
     }
 }
 
-/* Reparto 2..80 entre los dos radios:
- *   NRF2 -> 2..40 (39)      NRF3 -> 41..80 (40)                          */
+/* Reparto 2..80 entre los tres radios (79 canales / 3 = 26):
+ *   NRF2 -> 2..27 (26)   NRF1 -> 28..53 (26)   NRF3 -> 54..80 (27)      */
 static void generar_tabla(radio_t *r) {
     int idx  = (int)(r - radios);
     int por  = JAM_CH_N / NUM_RADIOS;            /* 39 */
