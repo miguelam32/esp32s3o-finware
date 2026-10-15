@@ -3,7 +3,7 @@
  * ESP32-S3 N16R8 (ESP-IDF v6.0.3) — Jammer BT/BLE con 3x nRF24L01+ PA/LNA
  *
  *   NRF2 -> SPI2 (CS 9)   canales  2..27   tarea en núcleo 0
- *   NRF1 -> SPI2 (CS 10)  canales 28..53   tarea en núcleo 0
+ *   NRF1 -> SPI2 (CS 10)  canales 28..53   tarea en núcleo 1
  *   NRF3 -> SPI3 (CS 21)  canales 54..80   tarea en núcleo 1
  *
  * Sin consola, sin comandos. Se enchufa y transmite.
@@ -17,10 +17,9 @@
  *   - dwell bajo  = mucha frecuencia de visita, blips cortos
  *   - dwell alto  = pocas visitas pero cada una corrompe paquetes de verdad
  *
- * LED WS2812 (GPIO48):
- *   VERDE    : jammer transmitiendo
- *   BLANCO   : destello corto en cada cambio de dwell
- *   ROJO     : falta algún NRF
+ * LED WS2812 (GPIO48), brillo 20% siempre:
+ *   ARCOIRIS lento : los 3 NRF vivos y jamming
+ *   APAGADO        : algun NRF no responde (no se prende nada)
  */
 
 #include <stdio.h>
@@ -40,8 +39,9 @@ static const char *TAG = "JAM";
 
 // ---------- LED ----------
 #define LED_GPIO        GPIO_NUM_48
-#define LED_BRILLO      60
+#define LED_BRILLO      51      /* 20% de 255: tenue a proposito */
 static led_strip_handle_t led;
+static volatile bool g_jam_ok = false;   /* true solo si los NUM_RADIOS viven */
 
 // ---------- Buses ----------
 #define PIN_SCK2   GPIO_NUM_12
@@ -115,9 +115,11 @@ typedef struct {
 } radio_t;
 
 static radio_t radios[NUM_RADIOS] = {
-    /* NRF2 y NRF1 comparten el bus SPI2 (SCK=12 MOSI=11 MISO=13) con CS
-     * distintos. Van en el MISMO nucleo a proposito: el lock del bus SPI2
-     * los serializa solo por scheduling, sin spinlock entre nucleos. */
+    /* Regla: nunca dos radios del MISMO bus en el MISMO nucleo.
+     *   core 0 -> NRF2 (SPI2), solo
+     *   core 1 -> NRF1 (SPI2) + NRF3 (SPI3): buses distintos, corren en
+     *            paralelo real sin contenerse por el lock del bus.
+     * NRF2 y NRF1 comparten SCK=12 MOSI=11 MISO=13 con CS distintos. */
     { .nombre = "NRF2", .host = SPI2_HOST,
       .ce = GPIO_NUM_5,  .cs = GPIO_NUM_9,  .sck = GPIO_NUM_12,
       .mosi = GPIO_NUM_11, .miso = GPIO_NUM_13,
@@ -125,7 +127,7 @@ static radio_t radios[NUM_RADIOS] = {
     { .nombre = "NRF1", .host = SPI2_HOST,
       .ce = GPIO_NUM_4,  .cs = GPIO_NUM_10, .sck = GPIO_NUM_12,
       .mosi = GPIO_NUM_11, .miso = GPIO_NUM_13,
-      .seed = 0xA17E55u, .core = 0 },
+      .seed = 0xA17E55u, .core = 1 },
     { .nombre = "NRF3", .host = SPI3_HOST,
       .ce = GPIO_NUM_1,  .cs = GPIO_NUM_21, .sck = GPIO_NUM_18,
       .mosi = GPIO_NUM_8, .miso = GPIO_NUM_7,
@@ -352,6 +354,30 @@ static void dwell_task(void *arg) {
 }
 
 /* ---------- LED ---------- */
+static uint32_t rainbow_hue(int64_t ahora_us) {
+    int64_t ciclo_us = 9000000;              /* 9 s por vuelta de arcoiris */
+    int64_t t = (ahora_us % ciclo_us) * 360 / ciclo_us;
+    return (uint32_t)t;
+}
+
+static void hsv_to_rgb(int hue, uint8_t v, uint8_t *r, uint8_t *g, uint8_t *b) {
+    if (hue < 0) hue = 0;
+    if (hue > 359) hue = 359;
+    int region = hue / 60;
+    int f = hue % 60;
+    int p = (v * (255 - (255 * f / 60))) / 255;
+    int q = (v * (255 - (255 * (60 - f) / 60))) / 255;
+    int t = (v * (255 * f / 60)) / 255;
+    switch (region) {
+        case 0:  *r = v; *g = (uint8_t)t; *b = 0;         break;
+        case 1:  *r = (uint8_t)q; *g = v; *b = 0;         break;
+        case 2:  *r = 0; *g = v; *b = (uint8_t)t;         break;
+        case 3:  *r = 0; *g = (uint8_t)q; *b = v;         break;
+        case 4:  *r = (uint8_t)t; *g = 0; *b = v;         break;
+        default: *r = v; *g = 0; *b = (uint8_t)p;         break;
+    }
+}
+
 static void led_set(uint8_t rr, uint8_t gg, uint8_t bb) {
     led_strip_set_pixel(led, 0, rr, gg, bb);
     led_strip_refresh(led);
@@ -379,16 +405,27 @@ static void led_init(void) {
 
 static void led_task(void *arg) {
     while (1) {
+        if (!g_jam_ok) {
+            /* Falta algun NRF: no se prende nada. */
+            led_set(0, 0, 0);
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
         if (g_flash) {
             g_flash = false;
-            led_set(60, 60, 60);
+            led_set(LED_BRILLO, LED_BRILLO, LED_BRILLO);
             vTaskDelay(pdMS_TO_TICKS(120));
             led_set(0, 0, 0);
             vTaskDelay(pdMS_TO_TICKS(80));
             continue;
         }
-        led_set(0, 60, 0);              /* verde: transmitiendo */
-        vTaskDelay(pdMS_TO_TICKS(200));
+        /* Los NUM_RADIOS vivos y transmitiendo: arcoiris lento y tenue. */
+        int64_t ahora = esp_timer_get_time();
+        uint32_t hue = rainbow_hue(ahora);
+        uint8_t r, g, b;
+        hsv_to_rgb((int)hue, LED_BRILLO, &r, &g, &b);
+        led_set(r, g, b);
+        vTaskDelay(pdMS_TO_TICKS(20));  /* 50 fps: transicion suave */
     }
 }
 
@@ -438,6 +475,8 @@ void app_main(void) {
 
     gptimer_init();
     gptimer_start(dwell_timer);
+
+    g_jam_ok = (activos == NUM_RADIOS);   /* arcoiris solo con los 3 vivos */
 
     xTaskCreate(led_task,  "led",   2048, NULL, 3, NULL);
     xTaskCreate(dwell_task, "dwell", 3072, NULL, 2, NULL);
