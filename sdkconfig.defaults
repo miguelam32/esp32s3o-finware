@@ -1,2 +1,87 @@
+# ============================================================
+#  sdkconfig.defaults - esp32s3o-finware (ESP32-S3 N16R8)
+#  Target: ESP-IDF v6.0.3
+#  CPU a 240MHz, flash Quad 16MB @120MHz HPM, PSRAM Octal 8MB
+#  @120MHz DDR - el techo real del chip (modo experimental)
+#  Pensado para 3x nRF24L01+:
+#    SPI2 -> NRF1 (CE4/CS10) + NRF2 (CE5/CS9)
+#    SPI3 -> NRF3 (CE1/CS21)
+#  Core0 = NRF2 solo | Core1 = NRF1 + NRF3 (buses distintos)
+# ============================================================
+
+# ---- CPU a tope: 240MHz, dual-core ----
+CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+# (dos nombres posibles según el build exacto de IDF 6.0.3; el que
+#  no aplique a tu versión se ignora solo, no rompe nada)
+# Dual-core ya es el default en S3 - nunca actives FREERTOS_UNICORE
+
+# ---- Flash: Quad 16MB a 120MHz (HPM) ----
+# Esto va ligado al PSRAM de abajo: en hardware F4R8 (flash Quad +
+# PSRAM Octal) PSRAM a 120MHz DDR SOLO es una combinación válida
+# si el flash también corre a 120MHz - comparten el mismo reloj
+# interno, según la tabla oficial de Espressif. No es opcional.
+# Riesgo real: no todos los chips de flash Quad soportan HPM a
+# 120MHz: depende del chip exacto soldado en tu módulo, algo que
+# no puedo ver desde acá (CONFIG_BOOTLOADER_FLASH_DC_AWARE de abajo
+# cubre a los que sí lo soportan pero necesitan el bootloader
+# avisado). Si no bootea o se cuelga al flashear: baja estas DOS
+# líneas Y las de PSRAM juntas de vuelta a 80M, no solo una.
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_120M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_BOOTLOADER_FLASH_DC_AWARE=y
+
+# ---- PSRAM: Octal 8MB a 120MHz DDR (el techo real del chip) ----
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_120M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_TIMING_TUNING_POINT_VIA_TEMPERATURE_SENSOR=y
+# 120MHz DDR es el límite real de la PSRAM octal embebida del S3;
+# por eso necesita CONFIG_IDF_EXPERIMENTAL_FEATURES para que el
+# propio menuconfig lo deje seleccionar. El único riesgo que
+# documenta Espressif: si la temperatura del chip sube/baja más de
+# ~20°C respecto a cuando booteó, puede haber lecturas corruptas o
+# crash random en accesos a PSRAM/flash. La línea TIMING_TUNING_POINT
+# de arriba crea una tarea que recalibra sola según temperatura para
+# mitigar justo eso - tu combo anterior (80/80) era el que ya tenías
+# probado en el S3 viejo; este es el salto al límite que pediste.
+
+# ---- Cache de instrucciones/datos al máximo ----
+# (menos fallos de caché leyendo flash y pegándole al ring buffer
+#  de captura que vive en PSRAM)
+CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
+CONFIG_ESP32S3_DATA_CACHE_64KB=y
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+
+# ---- Compilador a máximo rendimiento ----
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_BOOTLOADER_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_DISABLE=y
+
+# ---- FreeRTOS: tick más fino para repartir mejor las 3 tareas ----
+CONFIG_FREERTOS_HZ=1000
+
+# ---- SPI y GPIO en IRAM ----
+# Las transacciones con los 3 nRF24 y el toggle de CE/CS no se
+# frenan cuando la cache de flash se desactiva (ej. al escribir
+# algo en flash mientras un radio está transmitiendo)
+CONFIG_SPI_MASTER_IN_IRAM=y
+CONFIG_SPI_MASTER_ISR_IN_IRAM=y
+CONFIG_GPIO_CTRL_FUNC_IN_IRAM=y
+
+# ---- Watchdog ----
+# Con NRF1+NRF3 sondeando sin parar en el core1 (y NRF2 solo pero
+# a tope en el core0), la idle task de esos núcleos casi no llega
+# a correr -> sin esto el Task WDT te resetea el chip solo
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
+
+# ---- Nunca actives power management de CPU aquí ----
+# Con DFS/light-sleep el reloj se mueve solo y te mete jitter al
+# SPI de los radios. CONFIG_PM_ENABLE ya es "n" por default - déjalo así.
+
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=n
