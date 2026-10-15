@@ -17,14 +17,16 @@
  *   - dwell bajo  = mucha frecuencia de visita, blips cortos
  *   - dwell alto  = pocas visitas pero cada una corrompe paquetes de verdad
  *
- * LED WS2812 (GPIO48), brillo 20% siempre:
- *   ARCOIRIS lento : los 3 NRF vivos y jamming
+ * LED WS2812 (GPIO48), brillo base 20%:
+ *   ARCOIRIS lento y suave (senos desfasados + respiracion de brillo)
+ *     : los 3 NRF vivos y jamming
  *   APAGADO        : algun NRF no responde (no se prende nada)
  */
 
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/spi_master.h"
@@ -39,7 +41,15 @@ static const char *TAG = "JAM";
 
 // ---------- LED ----------
 #define LED_GPIO        GPIO_NUM_48
-#define LED_BRILLO      51      /* 20% de 255: tenue a proposito */
+#define LED_BRILLO      51      /* 20% de 255: brillo base, tenue a proposito */
+
+/* Arcoiris estilo "gamer": senos continuos en vez de HSV entero (sin
+ * bandas), mas lento, y con respiracion de brillo superpuesta. */
+#define LED_CICLO_US     18000000.0   /* 18 s por vuelta completa de color   */
+#define LED_BREATH_US     6000000.0   /* 6 s por ciclo de respiracion        */
+#define LED_BREATH_MIN     0.55       /* piso de brillo durante la respiracion */
+#define LED_REFRESCO_MS     16        /* ~60 fps: transicion imperceptible   */
+
 static led_strip_handle_t led;
 static volatile bool g_jam_ok = false;   /* true solo si los NUM_RADIOS viven */
 
@@ -353,29 +363,28 @@ static void dwell_task(void *arg) {
     }
 }
 
-/* ---------- LED ---------- */
-static uint32_t rainbow_hue(int64_t ahora_us) {
-    int64_t ciclo_us = 9000000;              /* 9 s por vuelta de arcoiris */
-    int64_t t = (ahora_us % ciclo_us) * 360 / ciclo_us;
-    return (uint32_t)t;
-}
+/* ---------- LED: arcoiris suave por senos + respiracion de brillo ---------- */
+/* Tres senos desfasados 120 grados (2*pi/3) dan un barrido de color
+ * continuo en punto flotante: sin los "escalones" que mete el HSV entero.
+ * Encima, el brillo "respira" con su propio seno mas lento (independiente
+ * del color), que es justo el efecto que usan los perifericos gamer en vez
+ * de solo girar el matiz a brillo fijo. */
+static void arcoiris_suave(int64_t ahora_us, uint8_t *r, uint8_t *g, uint8_t *b) {
+    double t = (double)ahora_us;
 
-static void hsv_to_rgb(int hue, uint8_t v, uint8_t *r, uint8_t *g, uint8_t *b) {
-    if (hue < 0) hue = 0;
-    if (hue > 359) hue = 359;
-    int region = hue / 60;
-    int f = hue % 60;
-    int p = (v * (255 - (255 * f / 60))) / 255;
-    int q = (v * (255 - (255 * (60 - f) / 60))) / 255;
-    int t = (v * (255 * f / 60)) / 255;
-    switch (region) {
-        case 0:  *r = v; *g = (uint8_t)t; *b = 0;         break;
-        case 1:  *r = (uint8_t)q; *g = v; *b = 0;         break;
-        case 2:  *r = 0; *g = v; *b = (uint8_t)t;         break;
-        case 3:  *r = 0; *g = (uint8_t)q; *b = v;         break;
-        case 4:  *r = (uint8_t)t; *g = 0; *b = v;         break;
-        default: *r = v; *g = 0; *b = (uint8_t)p;         break;
-    }
+    double fase_color = 2.0 * M_PI * t / LED_CICLO_US;
+    double rr = (sin(fase_color) + 1.0) * 0.5;
+    double gg = (sin(fase_color + 2.0 * M_PI / 3.0) + 1.0) * 0.5;
+    double bb = (sin(fase_color + 4.0 * M_PI / 3.0) + 1.0) * 0.5;
+
+    double fase_resp = 2.0 * M_PI * t / LED_BREATH_US;
+    double resp = LED_BREATH_MIN
+                + (1.0 - LED_BREATH_MIN) * ((sin(fase_resp) + 1.0) * 0.5);
+    double brillo = (double)LED_BRILLO * resp;
+
+    *r = (uint8_t)(rr * brillo + 0.5);
+    *g = (uint8_t)(gg * brillo + 0.5);
+    *b = (uint8_t)(bb * brillo + 0.5);
 }
 
 static void led_set(uint8_t rr, uint8_t gg, uint8_t bb) {
@@ -419,13 +428,13 @@ static void led_task(void *arg) {
             vTaskDelay(pdMS_TO_TICKS(80));
             continue;
         }
-        /* Los NUM_RADIOS vivos y transmitiendo: arcoiris lento y tenue. */
+        /* Los NUM_RADIOS vivos y transmitiendo: arcoiris lento, suave y
+         * respirando, estilo periferico gamer. */
         int64_t ahora = esp_timer_get_time();
-        uint32_t hue = rainbow_hue(ahora);
         uint8_t r, g, b;
-        hsv_to_rgb((int)hue, LED_BRILLO, &r, &g, &b);
+        arcoiris_suave(ahora, &r, &g, &b);
         led_set(r, g, b);
-        vTaskDelay(pdMS_TO_TICKS(20));  /* 50 fps: transicion suave */
+        vTaskDelay(pdMS_TO_TICKS(LED_REFRESCO_MS));  /* ~60 fps */
     }
 }
 
