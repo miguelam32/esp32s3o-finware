@@ -95,6 +95,21 @@ static volatile bool g_jam_ok = false;   /* true solo si los NUM_RADIOS viven */
 #define JAM_CH_HI   80
 #define JAM_CH_N    (JAM_CH_HI - JAM_CH_LO + 1)
 
+/* ---- Estrategia de cobertura ----
+ * El duty por canal es 1/(canales que cubre cada radio), y NO depende del
+ * dwell: un burst mas largo sobre un barrido mas lento da el mismo duty.
+ *
+ *   JAM_SPAN = 79 -> los 3 radios se reparten el espectro (26/26/27).
+ *                   Cobertura total, 3.8% de duty. AFH-proof.
+ *   JAM_SPAN = 26 -> los 3 radios cubren EL MISMO subconjunto. 11.5% de
+ *                   duty (+4.8 dB), pero deja 53 canales libres y ahi el
+ *                   AFH de BT puede mover el enlace y esquivarnos.
+ *
+ * Semillas distintas por radio => en cada instante estan en canales
+ * diferentes dentro de la ventana, asi que se solapan poco. */
+#define JAM_SPAN   26
+#define JAM_BASE    JAM_CH_LO
+
 /* Piso del silicio: el PLL del nRF tarda 130 us tipicos en enganchar al
  * cambiar de canal. 150 us = 130 de settle + 20 de margen. Por debajo de eso
  * el carrier no se estabiliza. El overhead de esta app es ~0 (el us/hop
@@ -207,14 +222,12 @@ static void barajar(radio_t *r) {
     }
 }
 
-/* Reparto 2..80 entre los tres radios (79 canales / 3 = 26):
- *   NRF2 -> 2..27 (26)   NRF1 -> 28..53 (26)   NRF3 -> 54..80 (27)      */
 static void generar_tabla(radio_t *r) {
-    int idx  = (int)(r - radios);
-    int por  = JAM_CH_N / NUM_RADIOS;            /* 39 */
-    int lo   = JAM_CH_LO + idx * por;
-    int hi   = lo + por - 1;
-    if (idx == NUM_RADIOS - 1) hi = JAM_CH_HI;   /* el último se lleva el resto */
+    int span = JAM_SPAN;
+    if (span > JAM_CH_N) span = JAM_CH_N;
+    int lo = JAM_BASE;
+    int hi = lo + span - 1;
+    if (hi > JAM_CH_HI) hi = JAM_CH_HI;
 
     int n = 0;
     for (int c = lo; c <= hi; c++) r->order[n++] = (uint8_t)c;
