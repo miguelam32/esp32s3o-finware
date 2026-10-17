@@ -84,7 +84,7 @@ static volatile bool g_jam_ok = false;
  * El PLL del nRF24 tarda 130 us en estabilizarse. Si el dwell es menor,
  * el chip emite "basura" inestable y el Bluetooth lo ignora.
  * Con 250-1000 us, el carrier es estable y corrompe paquetes completos. */
-static const uint32_t dwell_ladder[] = { 250, 450, 700, 1000 };
+static const uint32_t dwell_ladder[] = { 190, 200, 300, 400 };
 #define DWELL_STEPS      (sizeof(dwell_ladder) / sizeof(dwell_ladder[0]))
 #define DWELL_PERIOD_MS  5000
 
