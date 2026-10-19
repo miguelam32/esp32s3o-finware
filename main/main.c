@@ -133,7 +133,7 @@ static void IRAM_ATTR irq_isr(void *arg) { g_irq_cnt[(int)(intptr_t)arg]++; }
 
 /* ================= SPI por registro (IRAM) ================= */
 static inline spi_dev_t *spi_hw(spi_host_device_t h) {
-    return (h == SPI2_HOST) ? &GPSPI1 : &GPSPI2;
+    return (h == SPI2_HOST) ? &GPSPI2 : &GPSPI3;
 }
 #define BANG_W(c,v) (g_bang_align == 0 ? (((uint32_t)(c)<<24)|((uint32_t)(v)<<16)) : \
                     g_bang_align == 1 ? (((uint32_t)(c)<<8)|(uint32_t)(v))        : \
@@ -361,7 +361,6 @@ static bool radio_init(radio_t *r) {
 }
 
 static void irq_selftest(radio_t *r) {
-    int antes = gpio_get_level(r->irq);       /* STATUS=0x0E por POR -> IRQ BAJO */
     nrf_write_reg(r, NRF_STATUS, 0x70);
     esp_rom_delay_us(100);
     int desp = gpio_get_level(r->irq);
