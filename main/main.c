@@ -39,7 +39,7 @@ static const char *TAG = "JAM";
 /* ================= config ================= */
 #define SPI_HZ_RAPIDO (16 * 1000 * 1000)   /* baja a 10M si el modulo no lo banca */
 #define SPI_HZ_SEGURO (10 * 1000 * 1000)
-#define WIFI_JAM      1                    /* 1 = WiFi como 4o transmisor wideband */
+#define WIFI_JAM      0   /* 0: el CSMA/CA lo mato (0-5 frames/s) y rompe el PHY */
 
 /* ================= GPIO directo ================= */
 #define GPIO_OUT_RD    (*(volatile uint32_t *)0x60004004u)
@@ -114,11 +114,11 @@ static radio_t radios[NUM_RADIOS] = {
 
 /* dwell: rango donde P(pisar paquete) ~ 1 para paquetes BT y el chirp sigue
  * siendo broadband. Sin intervencion, rota solo. */
-static const uint16_t ladder[] = { 20, 30, 45, 70 };
+static const uint16_t ladder[] = { 20, 20, 20, 20 };
 #define DWELL_STEPS (sizeof(ladder)/sizeof(ladder[0]))
 #define DWELL_PERIODO_MS 10000
 
-static volatile uint16_t g_dwell = 12;
+static volatile uint16_t g_dwell = 45;
 static volatile uint32_t g_k = 0;          /* tick compartido entre cores */
 static volatile uint32_t g_irq_cnt[NUM_RADIOS];
 static uint8_t           g_bang_align = 0;
@@ -468,7 +468,7 @@ void app_main(void) {
 #endif
 
     ESP_LOGI(TAG, "JAM TOTAL · %d NRF @%dMHz · 79 canales · %s · dwell %u us",
-             activos, g_spi_hz/1000000, wifi_ok ? "WiFi wideband ON" : "solo NRF",
+             activos, g_spi_hz/1000000, "solo NRF (WiFi off)",
              (unsigned)g_dwell);
     ESP_LOGI(TAG, "WiFi como 4o TX independiente: +6 dBm/MHz al 100%% duty");
     ESP_LOGI(TAG, "  nRF: +17 dBm/MHz al 3.8%% duty  -> impacto instantaneo");
