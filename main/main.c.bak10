@@ -10,6 +10,10 @@
  * El PA del RFX2401C se apaga si bajas CE -> CHIRP (CE fijo) siempre.
  * Por debajo de 130us el PLL no engancha y la portadora BARRE: eso es
  * interferencia broadband deliberada, no un defecto.
+ *
+ * CS MANUAL (spics_io_num = -1): el periferico guarda el cs_pin_id del ultimo
+ * device y solo lo cambia cuando el driver cambia de device. Al saltear el
+ * driver con bang_write, el CS quedaba apuntando al radio equivocado.
  */
 
 #include <stdio.h>
@@ -35,7 +39,7 @@ static const char *TAG = "JAM";
 /* ================= config ================= */
 #define SPI_HZ_RAPIDO (16 * 1000 * 1000)   /* baja a 10M si el modulo no lo banca */
 #define SPI_HZ_SEGURO (10 * 1000 * 1000)
-#define WIFI_JAM      1                    /* 3er transmisor wideband (20 MHz) */
+#define WIFI_JAM      1                    /* 1 = WiFi como 4o transmisor wideband */
 
 /* ================= GPIO directo ================= */
 #define GPIO_OUT_RD    (*(volatile uint32_t *)0x60004004u)
@@ -138,9 +142,9 @@ static inline spi_dev_t *spi_hw(spi_host_device_t h) {
 static void bang_arm(radio_t *r) {
     spi_dev_t *hw = r->hw;
     hw->user.usr_mosi = 1;  hw->user.usr_miso = 0;
-    hw->user.usr_addr = 0;  hw->user.usr_command = 0; hw->user.usr_dummy = 0;
-    hw->user.wr_bit_order = 0; hw->user.rd_bit_order = 0;
-    hw->dma_conf.dma_tx_ena = 0; hw->dma_conf.dma_rx_ena = 0;
+    hw->user.usr_addr = 0;  hw->user.usr_command = 0;  hw->user.usr_dummy = 0;
+    hw->user.wr_bit_order = 0;  hw->user.rd_bit_order = 0;
+    hw->dma_conf.dma_tx_ena = 0;  hw->dma_conf.dma_rx_ena = 0;
     hw->ms_dlen.ms_data_bitlen = 15;
 }
 
@@ -157,12 +161,12 @@ static inline IRAM_ATTR void bang_write(radio_t *r, uint8_t cmd, uint8_t val) {
 /* ================= driver (init), CS manual ================= */
 static void nrf_write_reg(radio_t *r, uint8_t reg, uint8_t val) {
     spi_transaction_t t = { .flags=SPI_TRANS_USE_TXDATA, .length=16 };
-    t.tx_data[0] = CMD_W_REGISTER | reg; t.tx_data[1] = val;
+    t.tx_data[0] = CMD_W_REGISTER | reg;  t.tx_data[1] = val;
     cs_lo(r); spi_device_polling_transmit(r->spi, &t); cs_hi(r);
 }
 static uint8_t nrf_read_reg(radio_t *r, uint8_t reg) {
     spi_transaction_t t = { .flags=SPI_TRANS_USE_TXDATA|SPI_TRANS_USE_RXDATA, .length=16 };
-    t.tx_data[0] = CMD_R_REGISTER | reg; t.tx_data[1] = 0xFF;
+    t.tx_data[0] = CMD_R_REGISTER | reg;  t.tx_data[1] = 0xFF;
     cs_lo(r); spi_device_polling_transmit(r->spi, &t); cs_hi(r);
     return t.rx_data[1];
 }
@@ -207,7 +211,8 @@ static inline IRAM_ATTR void hop(radio_t *r, uint32_t k) {
 
 /* ================= LED ================= */
 static void led_set(uint8_t rr, uint8_t gg, uint8_t bb) {
-    led_strip_set_pixel(led, 0, rr, gg, bb); led_strip_refresh(led);
+    led_strip_set_pixel(led, 0, rr, gg, bb);
+    led_strip_refresh(led);
 }
 static void arcoiris(int64_t t, uint8_t *r, uint8_t *g, uint8_t *b) {
     double d = (double)t;
@@ -234,7 +239,7 @@ static void led_init(void) {
     led_set(0,0,0);
 }
 
-/* ================= WiFi: 3er transmisor wideband ================= */
+/* ================= WiFi: 4o transmisor wideband ================= */
 #if WIFI_JAM
 static const uint8_t wch[3] = { 1, 6, 11 };   /* 20 MHz cada uno: ~20 canales BT */
 static int      wch_idx = 0;
@@ -247,12 +252,8 @@ static bool     wifi_ok = false;
  *   ~20 frames/s    -> el CSMA/CA lo esta matando (backoff por los nRF) */
 static volatile uint32_t g_wifi_frames = 0;
 
-/* Intervalo entre llamadas. 0 = loop agresivo (maximo duty, maxima carga de
- * CPU). Subilo si el WDT o los nRF se resentis. */
-#define WIFI_INTERVALO_US 0
-
-/* Rotacion de canal WiFi. Cada 100 ms cambia 1/6/11. */
-#define WIFI_ROTA_MS      100
+#define WIFI_INTERVALO_US 0    /* 0 = loop agresivo. Subilo si el WDT barkea. */
+#define WIFI_ROTA_MS      100  /* rotacion de canal WiFi */
 
 static void wifi_jam_init(void) {
     if (nvs_flash_init() != ESP_OK) { ESP_LOGW(TAG, "NVS fail"); return; }
@@ -275,11 +276,6 @@ static void wifi_jam_init(void) {
     wifi_ok = true;
     ESP_LOGI(TAG, "WiFi TX wideband ON (ch 1/6/11)");
 }
-static void wifi_jam_step(void) {
-    if (!wifi_ok) return;
-    esp_wifi_80211_tx(WIFI_IF_STA, wframe, sizeof(wframe), false);
-}
-#endif
 
 /* Tarea del WiFi: loop agresivo de inyeccion. En core 0, prioridad ALTA
  * (no maxima) para no matar a jam_loop_b, que tambien esta en core 0.
@@ -304,6 +300,23 @@ static void wifi_task(void *arg) {
         vTaskDelay(1);   /* cede: si no, el WDT de core 0 barkea */
     }
 }
+
+/* Log del duty del WiFi. En core 0, prioridad baja: nunca puede colgar el
+ * jammer. Mide si el CSMA/CA esta frenando la inyeccion por culpa de los nRF.
+ *   4000 frames/s -> duty alto, el CSMA no lo frena
+ *     20 frames/s -> el CSMA/CA lo mato (backoff), el WiFi no aporta */
+static void wifi_log_task(void *arg) {
+    uint32_t prev = 0;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        uint32_t dwf = g_wifi_frames - prev;
+        prev = g_wifi_frames;
+        ESP_LOGI(TAG, "WiFi: %lu frames/s (duty ~%lu%%) ch_wifi=%u",
+                 (unsigned long)(dwf / 2), (unsigned long)(dwf / 2 * 100 / 4000),
+                 (unsigned)wch[wch_idx]);
+    }
+}
+#endif /* WIFI_JAM */
 
 /* ================= init ================= */
 static void bus_init(spi_host_device_t h, gpio_num_t sck, gpio_num_t mosi, gpio_num_t miso) {
@@ -365,31 +378,23 @@ static bool bang_probar(radio_t *r, uint8_t a) {
 /* ================= loops ================= */
 /* core 1: SPI2 (NRF2 + NRF1). Lleva el tick global y el LED. */
 static void IRAM_ATTR jam_loop_a(void *arg) {
-    uint32_t t_led = 0, t_peld = 0;
+    uint32_t t_led = 0, t_peld = 0, t_safe = 0;
     int peld = 0;
     for (;;) {
         uint32_t c0 = cyc();
         g_k++;
-        hop(&radios[0], g_k);
-        hop(&radios[1], g_k);
+        if (radios[0].spi) hop(&radios[0], g_k);
+        if (radios[1].spi) hop(&radios[1], g_k);
 
         uint32_t obj = (uint32_t)g_dwell * CPU_MHZ;
         while (cyc() - c0 < obj) { }
 
         uint32_t now = cyc();
         if (now - t_led >= (uint32_t)LED_REFRESCO_MS * MS_CYC) { t_led = now; led_update(); }
-        {
-            static uint32_t wprev = 0, t_wlog = 0;
-            if (now - t_wlog >= 2000u * MS_CYC) {
-                t_wlog = now;
-                uint32_t dwf = g_wifi_frames - wprev;
-                wprev = g_wifi_frames;
-                ESP_LOGI(TAG, "WiFi: %lu frames/s (duty ~%lu%%) ch_wifi=%u",
-                         (unsigned long)(dwf/2),
-                         (unsigned long)(dwf/2*100/4000),
-                         (unsigned)wch[wch_idx]);
-            }
-        }
+        /* El duty del WiFi se loguea desde wifi_log_task (core 0): un ESP_LOGI
+         * desde esta tarea, de prioridad maxima, puede colgarse con el lock
+         * de stdout tomado. */
+        if (now - t_safe >= 5000u * MS_CYC) { t_safe = now; vTaskDelay(1); }
         if (now - t_peld >= (uint32_t)DWELL_PERIODO_MS * MS_CYC) {
             t_peld = now;
             peld = (peld + 1) % DWELL_STEPS;
@@ -399,12 +404,12 @@ static void IRAM_ATTR jam_loop_a(void *arg) {
     }
 }
 
-/* core 0: SPI3 (NRF3) + WiFi wideband. Sigue el tick de core 1. */
+/* core 0: SPI3 (NRF3). Sigue el tick de core 1. */
 static void IRAM_ATTR jam_loop_b(void *arg) {
     uint32_t last = 0, t_yield = 0;
     for (;;) {
         uint32_t k = g_k;
-        if (k != last) { last = k; hop(&radios[2], k); }
+        if (k != last && radios[2].spi) { last = k; hop(&radios[2], k); }
 
         uint32_t now = cyc();
         if (now - t_yield >= 2000u * MS_CYC) { t_yield = now; vTaskDelay(1); }
@@ -422,9 +427,11 @@ void app_main(void) {
     int activos = 0;
     for (int i = 0; i < NUM_RADIOS; i++) if (radio_init(&radios[i])) activos++;
     if (activos == 0) {
-        ESP_LOGE(TAG, "NINGUN NRF responde.");
+        ESP_LOGE(TAG, "NINGUN NRF responde. Revisa cableado y 3.3V.");
         for (;;) { led_set(60,0,0); vTaskDelay(pdMS_TO_TICKS(200)); }
     }
+    if (activos < NUM_RADIOS)
+        ESP_LOGW(TAG, "Solo %d de %d NRF: sigo con los que si", activos, NUM_RADIOS);
 
     for (int i = 0; i < NUM_RADIOS; i++) {
         if (!radios[i].spi) continue;
@@ -437,8 +444,10 @@ void app_main(void) {
         if (!radios[i].spi) continue;
         int al = -1;
         for (int a = 0; a < 3 && al < 0; a++) if (bang_probar(&radios[i], (uint8_t)a)) al = a;
-        if (al < 0) { ESP_LOGE(TAG, "%s BANG ROTO -> ABORTO", radios[i].nombre);
-                      for (;;) { led_set(60,0,0); vTaskDelay(pdMS_TO_TICKS(200)); } }
+        if (al < 0) {
+            ESP_LOGE(TAG, "%s BANG ROTO: las 3 alineaciones fallan -> ABORTO", radios[i].nombre);
+            for (;;) { led_set(60,0,0); vTaskDelay(pdMS_TO_TICKS(200)); }
+        }
         ESP_LOGI(TAG, "%s bang OK (align=%d)", radios[i].nombre, al);
         nrf_write_reg(&radios[i], NRF_RF_CH, JAM_CH_LO);
         radios[i].canal = JAM_CH_LO;
@@ -449,13 +458,19 @@ void app_main(void) {
     wifi_jam_init();
 #endif
 
+    /* Arcoiris solo con los 3 vivos. Si falta uno: LED apagado, pero sigue
+     * jameando con los que si. */
     g_jam_ok = (activos == NUM_RADIOS);
 
     xTaskCreatePinnedToCore(jam_loop_a, "jamA", 4096, NULL, configMAX_PRIORITIES-1, NULL, 1);
     xTaskCreatePinnedToCore(jam_loop_b, "jamB", 4096, NULL, configMAX_PRIORITIES-1, NULL, 0);
-    if (wifi_ok)
+#if WIFI_JAM
+    if (wifi_ok) {
         xTaskCreatePinnedToCore(wifi_task, "wifi", 4096, NULL,
                                 configMAX_PRIORITIES-2, NULL, 0);
+        xTaskCreatePinnedToCore(wifi_log_task, "wlog", 2048, NULL, 1, NULL, 0);
+    }
+#endif
 
     ESP_LOGI(TAG, "JAM TOTAL · %d NRF @%dMHz · 79 canales · %s · dwell %u us",
              activos, g_spi_hz/1000000, wifi_ok ? "WiFi wideband ON" : "solo NRF",

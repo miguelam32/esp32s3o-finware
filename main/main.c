@@ -143,7 +143,7 @@ static void bang_arm(radio_t *r) {
     spi_dev_t *hw = r->hw;
     hw->user.usr_mosi = 1;  hw->user.usr_miso = 0;
     hw->user.usr_addr = 0;  hw->user.usr_command = 0;  hw->user.usr_dummy = 0;
-    hw->user.wr_bit_order = 0;  hw->user.rd_bit_order = 0;
+    /* bit order: MSB primero es el default del periferico, no hace falta tocarlo */
     hw->dma_conf.dma_tx_ena = 0;  hw->dma_conf.dma_rx_ena = 0;
     hw->ms_dlen.ms_data_bitlen = 15;
 }
