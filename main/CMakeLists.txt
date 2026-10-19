@@ -4,12 +4,17 @@ idf_component_register(
     REQUIRES
         esp_driver_spi
         esp_driver_gpio
-        esp_driver_gptimer
         esp_driver_rmt
         esp_timer
         esp_hw_support
-        heap
+        esp_rom
         freertos
         log
+        heap
+        nvs_flash
+        esp_netif
+        esp_event
+        esp_wifi
         led_strip
 )
+
