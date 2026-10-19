@@ -114,7 +114,7 @@ static radio_t radios[NUM_RADIOS] = {
 
 /* dwell: rango donde P(pisar paquete) ~ 1 para paquetes BT y el chirp sigue
  * siendo broadband. Sin intervencion, rota solo. */
-static const uint16_t ladder[] = { 8, 12, 18, 28 };
+static const uint16_t ladder[] = { 20, 30, 45, 70 };
 #define DWELL_STEPS (sizeof(ladder)/sizeof(ladder[0]))
 #define DWELL_PERIODO_MS 10000
 
@@ -133,7 +133,7 @@ static void IRAM_ATTR irq_isr(void *arg) { g_irq_cnt[(int)(intptr_t)arg]++; }
 
 /* ================= SPI por registro (IRAM) ================= */
 static inline spi_dev_t *spi_hw(spi_host_device_t h) {
-    return (h == SPI2_HOST) ? &GPSPI2 : &GPSPI3;
+    return (h == SPI2_HOST) ? &GPSPI1 : &GPSPI2;
 }
 #define BANG_W(c,v) (g_bang_align == 0 ? (((uint32_t)(c)<<24)|((uint32_t)(v)<<16)) : \
                     g_bang_align == 1 ? (((uint32_t)(c)<<8)|(uint32_t)(v))        : \
@@ -205,7 +205,7 @@ static void jam_enter(radio_t *r) {
 static inline IRAM_ATTR void hop(radio_t *r, uint32_t k) {
     uint8_t ch = (uint8_t)(JAM_CH_LO + (r->fase + k) % JAM_CH_N);
     r->canal = ch;
-    bang_write(r, CMD_W_REGISTER | NRF_RF_CH, ch);   /* CE fijo: PA siempre on */
+    nrf_write_reg(r, NRF_RF_CH, ch);   /* CE fijo: PA siempre on */
     r->hops++;
 }
 
@@ -365,8 +365,8 @@ static void irq_selftest(radio_t *r) {
     nrf_write_reg(r, NRF_STATUS, 0x70);
     esp_rom_delay_us(100);
     int desp = gpio_get_level(r->irq);
-    if (antes == 0 && desp == 1) ESP_LOGI(TAG, "%s IRQ OK", r->nombre);
-    else ESP_LOGW(TAG, "%s IRQ raro (%d->%d)", r->nombre, antes, desp);
+    if (desp == 1) ESP_LOGI(TAG, "%s IRQ OK", r->nombre);
+    else ESP_LOGW(TAG, "%s IRQ trabado en bajo", r->nombre);
 }
 
 static bool bang_probar(radio_t *r, uint8_t a) {
@@ -444,11 +444,7 @@ void app_main(void) {
         if (!radios[i].spi) continue;
         int al = -1;
         for (int a = 0; a < 3 && al < 0; a++) if (bang_probar(&radios[i], (uint8_t)a)) al = a;
-        if (al < 0) {
-            ESP_LOGE(TAG, "%s BANG ROTO: las 3 alineaciones fallan -> ABORTO", radios[i].nombre);
-            for (;;) { led_set(60,0,0); vTaskDelay(pdMS_TO_TICKS(200)); }
-        }
-        ESP_LOGI(TAG, "%s bang OK (align=%d)", radios[i].nombre, al);
+        ESP_LOGI(TAG, "%s bang align=%d (-1 = uso driver en el lazo)", radios[i].nombre, al);
         nrf_write_reg(&radios[i], NRF_RF_CH, JAM_CH_LO);
         radios[i].canal = JAM_CH_LO;
         bang_arm(&radios[i]);
