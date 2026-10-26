@@ -1,106 +1,82 @@
 /*
- * =============================================================================
- *  main.c — BT-KILLER 2.4 GHz — ESP32-S3 N16R8 — ESP-IDF v6
- *  3x nRF24L01+ PA/LNA.  UN SOLO MODO: BARRIDO TOTAL 2402..2480 MHz.
- * =============================================================================
+ * main.c — MARTILLO — ESP32-S3 N16R8 (ESP-IDF v6.0.3) — 3x nRF24L01+ PA/LNA
  *
- *   NRF2 -> SPI2 (CS  9) CE  5 | core 1
- *   NRF1 -> SPI2 (CS 10) CE  4 | core 1
- *   NRF3 -> SPI3 (CS 21) CE  1 | core 0
+ *   NRF2 -> SPI2 (CS  9)  canales  2..27   | core 1
+ *   NRF1 -> SPI2 (CS 10)  canales 28..53   | core 1
+ *   NRF3 -> SPI3 (CS 21)  canales 54..80   | core 0
  *
- * -----------------------------------------------------------------------------
- *  QUE HACE
- * -----------------------------------------------------------------------------
- *  Los 3 radios barren los 79 canales BT/BLE (RF_CH 2..80) en CONT_WAVE,
- *  desfasados 26 canales entre si, lo mas rapido que el SPI lo permita.
- *  CE queda FIJO EN ALTO: el PA nunca se apaga, el carrier nunca se corta,
- *  solo salta de frecuencia. Cero huecos de PA.
+ * CONT_WAVE + PLL_LOCK, CE strobe (CE bajo -> RF_CH -> CE alto).
  *
- * -----------------------------------------------------------------------------
- *  POR QUE ESTE Y NO OTRO
- * -----------------------------------------------------------------------------
- *  Duty por canal = radios / canales = 3/79 = 3.8%.  No se sube sin bajar
- *  canales o meter mas radios.
+ * ============================================================================
+ *  QUE CAMBIA RESPECTO AL JAMMER VIEJO (y por que)
+ * ============================================================================
+ *  1) ORDEN SECUENCIAL en vez de random. Un salto de 1 MHz deja que el PLL
+ *     enganche en una fraccion del dwell, asi que TODO el dwell es un strike
+ *     real sobre el canal objetivo. Con orden random el salto es de hasta
+ *     50 MHz y el PLL se come el dwell entero re-lockeando al pedo: de 150 us
+ *     de dwell solo ~20 us pegaban de verdad. Eso alcanza para un SBC de
+ *     auricular barato, no para un LDAC con AFH agresiva y buffer grande.
  *
- *  Revisita = canales x tiempo_hop.  Para que un slot BT de 625 us SIEMPRE
- *  reciba un golpe hace falta hop < 7.9 us.  Con dwell 130us la revisita se
- *  va a 10 ms y el audifono se salva.  => el dwell TIENE que ser corto.
+ *  2) La escalera de dwell ahora SI incluye el punto medio y el rapido:
+ *     150 us (strike limpio, revisita 3.9 ms) -> 60 -> 30 (revisita 780 us).
+ *     Duty por canal es 1/26 = 3.8% y NO cambia con el dwell: el dwell solo
+ *     mueve la revisita. Menos dwell = mas seguido pega = mas PER sobre
+ *     paquetes cortos. Mas dwell = strike mas limpio = mas alcance.
  *
- * -----------------------------------------------------------------------------
- *  AFH: lo que rompe a la mayoria de los jammers
- * -----------------------------------------------------------------------------
- *  BT Classic usa AFH: el master mapea los canales malos y deja de saltar
- *  por ahi.  Si jameas poco ancho, AFH te esquiva y no pasa nada.  AFH solo
- *  saca del mapa canales PERSISTENTEMENTE malos -> un barrido rapido y ancho
- *  hace que TODOS esten malos a la vez y AFH no tenga a donde ir.
+ *  3) NRF1 y NRF2 van JUNTOS en core 1 (comparten SPI2, asi no se pelean el
+ *     lock del bus entre nucleos). NRF3 solo en core 0.
  *
- * -----------------------------------------------------------------------------
- *  KNOBS
- * -----------------------------------------------------------------------------
- *  DWELL_US   0 = hop a fondo (revisita minima). 10-20 = compromiso.
- *             150 = carrier limpio pero revisita 12 ms (malo para 625 us).
- *  SPI_HZ     hasta 20 MHz, con escalera de fallback para clones.
- *  YIELD_MS   cada cuanto se cede un tick.  Poner CONFIG_FREERTOS_HZ=1000
- *             para que el hueco sea de 1 ms en vez de 10 ms.
- * =============================================================================
+ *  4) Refresh de RF_SETUP cada vuelta: los clones Si24R1 se caen solos del
+ *     modo CONT_WAVE y dejan de radiar.
+ *
+ * ============================================================================
+ *  POR QUE LOS CAROS SOBREVIVEN (para que sepas contra que peleas)
+ * ============================================================================
+ *  AFH: mientras TODOS los canales esten malos parejo, AFH no tiene a donde
+ *  escapar y mantiene el hop set lleno. Eso el split ya lo logra.
+ *  Lo que NO logra un strike sucio es subir el PER lo suficiente: el caro
+ *  tiene buffer grande + error concealment + mejor front-end y absorbe el
+ *  residual. Contra eso se pelea con strike LIMPIO (secuencial + dwell >=
+ *  lock) y revisita corta, no con mas potencia bruta.
+ *
+ *  Si con esto sigue sin caer, el techo de 3 radios sobre 79 canales ya lo
+ *  diste: ahi se sube con mas modulos, mejores antenas, o metiendo el WiFi
+ *  del propio ESP32 como fuente ancha.
+ * ============================================================================
  */
 
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
 #include <math.h>
-
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
+#include "driver/gptimer.h"
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "esp_rom_sys.h"
-#include "soc/spi_struct.h"
+#include "rom/ets_sys.h"
 #include "led_strip.h"
-#include "nvs_flash.h"
 
-static const char *TAG = "BTKILL";
+static const char *TAG = "MART";
 
-/* ============================ CONFIG ============================ */
-#define CH_LO        2                      /* 2402 MHz */
-#define CH_HI        80                     /* 2480 MHz */
-#define NUM_CANALES  (CH_HI - CH_LO + 1)    /* 79 canales BT/BLE */
-
-#define NUM_RADIOS   3
-#define DWELL_US     180        /* 0 = maxima velocidad. Ver KNOBS arriba. */
-#define YIELD_MS     1000      /* cesion de tick, 1 vez por segundo */
-
-/* Escalera de reloj SPI: se prueba de arriba a abajo hasta que el chip
-   responda el eco de RF_CH.  Los clones aguantan menos. */
-static const int spi_hz_escalera[] = { 20000000, 16000000, 10000000, 8000000 };
-#define N_HZ (sizeof(spi_hz_escalera) / sizeof(spi_hz_escalera[0]))
-
-/* ============================ GPIO crudo ============================ */
-#define GPIO_OUT_W1TS  (*(volatile uint32_t *)0x60004008u)
-#define GPIO_OUT_W1TC  (*(volatile uint32_t *)0x6000400Cu)
-
-/* ============================ tiempo ============================ */
-#define CPU_MHZ 240u
-#define MS_CYC  (CPU_MHZ * 1000u)
-
-static inline __attribute__((always_inline)) uint32_t cyc(void) {
-    uint32_t c; __asm__ __volatile__("rsr.ccount %0" : "=a"(c)); return c;
-}
-
-/* ============================ LED ============================ */
+// ---------- LED ----------
 #define LED_GPIO        GPIO_NUM_48
-#define LED_BRILLO      60
-#define LED_CICLO_US    18000000.0
-#define LED_BREATH_US   6000000.0
-#define LED_BREATH_MIN  0.55
-#define LED_REFRESCO_MS 16
-
+#define LED_BRILLO      51
 static led_strip_handle_t led;
-static volatile bool      g_jam_ok = false;
+static volatile bool g_jam_ok = false;
 
-/* ============================ nRF24 ============================ */
+// ---------- Buses ----------
+#define PIN_SCK2   GPIO_NUM_12
+#define PIN_MOSI2  GPIO_NUM_11
+#define PIN_MISO2  GPIO_NUM_13
+#define PIN_SCK3   GPIO_NUM_18
+#define PIN_MOSI3  GPIO_NUM_8
+#define PIN_MISO3  GPIO_NUM_7
+#define SPI_HZ     (10 * 1000 * 1000)
+
+// ---------- nRF24L01+ ----------
 #define NRF_CONFIG     0x00
 #define NRF_EN_AA      0x01
 #define NRF_EN_RXADDR  0x02
@@ -109,353 +85,343 @@ static volatile bool      g_jam_ok = false;
 #define NRF_RF_CH      0x05
 #define NRF_RF_SETUP   0x06
 #define NRF_STATUS     0x07
-#define NRF_TX_ADDR    0x10
 
-#define CMD_R_REGISTER 0x00
-#define CMD_W_REGISTER 0x20
-#define CMD_FLUSH_TX   0xE1
+#define CMD_R_REGISTER  0x00
+#define CMD_W_REGISTER  0x20
+#define CMD_FLUSH_TX    0xE1
 
-#define RF_CONT_WAVE (1u << 7)
-#define RF_PLL_LOCK  (1u << 4)
-#define RF_SETUP_MAX 0x0E                       /* PA 0 dBm = maximo del chip */
-#define RF_SETUP_CW  (RF_SETUP_MAX | RF_CONT_WAVE | RF_PLL_LOCK)
-#define CONFIG_TX    0x0E
+#define RF_CONT_WAVE  (1u << 7)
+#define RF_PLL_LOCK   (1u << 4)
 
-/* ============================ radios ============================ */
+#define RF_SETUP_VALOR  0x0E       /* RF_PWR=11 (0 dBm) */
+#define CONFIG_MODO_TX  0x0E
+
+// ---------- Jammer ----------
+#define NUM_RADIOS  3
+
+#define JAM_CH_LO   2
+#define JAM_CH_HI   80
+#define JAM_CH_N    (JAM_CH_HI - JAM_CH_LO + 1)   /* 79 */
+
+/* Piso del silicio: ~130 us de asentamiento del PLL. 150 = 130 + margen.
+ * El techo practico del barrido: por encima de 170 us la vuelta pasa de 6.6 ms
+ * y el duty por canal cae sin ganar nada.
+ * El escalon de 30 us: con orden SECUENCIAL el salto es de 1 MHz, el PLL
+ * engancha rapido y la revisita baja a 780 us -> pega mucho mas seguido.
+ * Ese es el escalon que apunta a los dispositivos con AFH buena y buffer. */
+static const uint32_t dwell_ladder[] = { 150, 60, 30 };
+#define DWELL_STEPS      (sizeof(dwell_ladder) / sizeof(dwell_ladder[0]))
+#define DWELL_PERIOD_MS  5000
+
 typedef struct {
-    const char *nombre;
+    const char       *nombre;
     spi_host_device_t host;
-    gpio_num_t ce, cs, sck, mosi, miso, irq;
-    uint8_t    fase;            /* offset dentro del barrido */
+    gpio_num_t        ce, cs, sck, mosi, miso;
+    int               core;
+
     spi_device_handle_t spi;
-    spi_dev_t *hw;
-    uint8_t    canal;
-    uint32_t   k;               /* contador de hop */
+    TaskHandle_t        task;
+
+    uint8_t  ch_lo, ch_hi;      /* rebanada de este radio */
+    uint8_t  canal;
+    uint32_t vueltas;
+    uint32_t ch_idx;
+
     volatile uint32_t hops;
-    bool       bang_ok;
 } radio_t;
 
 static radio_t radios[NUM_RADIOS] = {
-    { .nombre="NRF2", .host=SPI2_HOST, .fase=0,
-      .ce=GPIO_NUM_5, .cs=GPIO_NUM_9,  .sck=GPIO_NUM_12, .mosi=GPIO_NUM_11, .miso=GPIO_NUM_13, .irq=GPIO_NUM_16 },
-    { .nombre="NRF1", .host=SPI2_HOST, .fase=0,
-      .ce=GPIO_NUM_4, .cs=GPIO_NUM_10, .sck=GPIO_NUM_12, .mosi=GPIO_NUM_11, .miso=GPIO_NUM_13, .irq=GPIO_NUM_15 },
-    { .nombre="NRF3", .host=SPI3_HOST, .fase=0,
-      .ce=GPIO_NUM_1, .cs=GPIO_NUM_21, .sck=GPIO_NUM_18, .mosi=GPIO_NUM_8,  .miso=GPIO_NUM_7,  .irq=GPIO_NUM_2  },
+    /* Regla: NUNCA dos radios del MISMO bus en nucleos distintos (se pelean
+     * el lock del bus entre cores). NRF1 y NRF2 comparten SPI2 -> van juntos
+     * en core 1. NRF3 en SPI3 solo, en core 0. */
+    { .nombre = "NRF2", .host = SPI2_HOST,
+      .ce = GPIO_NUM_5,  .cs = GPIO_NUM_9,  .sck = GPIO_NUM_12,
+      .mosi = GPIO_NUM_11, .miso = GPIO_NUM_13, .core = 1 },
+    { .nombre = "NRF1", .host = SPI2_HOST,
+      .ce = GPIO_NUM_4,  .cs = GPIO_NUM_10, .sck = GPIO_NUM_12,
+      .mosi = GPIO_NUM_11, .miso = GPIO_NUM_13, .core = 1 },
+    { .nombre = "NRF3", .host = SPI3_HOST,
+      .ce = GPIO_NUM_1,  .cs = GPIO_NUM_21, .sck = GPIO_NUM_18,
+      .mosi = GPIO_NUM_8,  .miso = GPIO_NUM_7,  .core = 0 },
 };
 
-static volatile uint16_t g_dwell = DWELL_US;
-static uint8_t           g_bang_align = 0;
-static int               g_spi_hz = 0;
+static gptimer_handle_t  dwell_timer;
+static volatile uint32_t g_dwell = dwell_ladder[0];
+static volatile bool     g_flash = false;
 
-static inline void ce_hi(radio_t *r) { GPIO_OUT_W1TS = 1u << (uint32_t)r->ce; }
-static inline void ce_lo(radio_t *r) { GPIO_OUT_W1TC = 1u << (uint32_t)r->ce; }
-static inline void cs_lo(radio_t *r) { GPIO_OUT_W1TC = 1u << (uint32_t)r->cs; }
-static inline void cs_hi(radio_t *r) { GPIO_OUT_W1TS = 1u << (uint32_t)r->cs; }
+static inline void ce_hi(radio_t *r) { gpio_set_level(r->ce, 1); }
+static inline void ce_lo(radio_t *r) { gpio_set_level(r->ce, 0); }
 
-/* ============================ SPI por registro ============================ */
-static inline spi_dev_t *spi_hw(spi_host_device_t h) {
-    return (h == SPI2_HOST) ? &GPSPI2 : &GPSPI3;
-}
-
-/* El byte va a un lane distinto del data_buf segun la alineacion del chip.
-   Se autodetecta: align 0/1/2. */
-#define BANG_W(c,v) (g_bang_align == 0 ? (((uint32_t)(c)<<24)|((uint32_t)(v)<<16)) : \
-                    g_bang_align == 1 ? (((uint32_t)(c)<<8)|(uint32_t)(v))         : \
-                                        (((uint32_t)(c))|((uint32_t)(v)<<8)))
-
-static void bang_arm(radio_t *r) {
-    spi_dev_t *hw = r->hw;
-    hw->user.usr_mosi = 1;  hw->user.usr_miso = 0;
-    hw->user.usr_addr = 0;  hw->user.usr_command = 0;  hw->user.usr_dummy = 0;
-    hw->dma_conf.dma_tx_ena = 0;  hw->dma_conf.dma_rx_ena = 0;
-    hw->ms_dlen.ms_data_bitlen = 15;    /* 16 bits */
-}
-
-static inline IRAM_ATTR void bang_write(radio_t *r, uint8_t cmd, uint8_t val) {
-    spi_dev_t *hw = r->hw;
-    cs_lo(r);
-    hw->data_buf[0] = BANG_W(cmd, val);
-    hw->cmd.usr = 1;
-    uint32_t g = 100000;
-    while (hw->cmd.usr && --g) { }
-    cs_hi(r);
-}
-
-/* ============================ driver (init) ============================ */
-static void nrf_write_reg(radio_t *r, uint8_t reg, uint8_t val) {
+/* ================= SPI ================= */
+static void nrf_write_reg(spi_device_handle_t dev, uint8_t reg, uint8_t val) {
     spi_transaction_t t = { .flags = SPI_TRANS_USE_TXDATA, .length = 16 };
-    t.tx_data[0] = CMD_W_REGISTER | reg;  t.tx_data[1] = val;
-    cs_lo(r); spi_device_polling_transmit(r->spi, &t); cs_hi(r);
+    t.tx_data[0] = CMD_W_REGISTER | reg;
+    t.tx_data[1] = val;
+    spi_device_polling_transmit(dev, &t);
 }
-static uint8_t nrf_read_reg(radio_t *r, uint8_t reg) {
+static uint8_t nrf_read_reg(spi_device_handle_t dev, uint8_t reg) {
     spi_transaction_t t = { .flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA, .length = 16 };
-    t.tx_data[0] = CMD_R_REGISTER | reg;  t.tx_data[1] = 0xFF;
-    cs_lo(r); spi_device_polling_transmit(r->spi, &t); cs_hi(r);
+    t.tx_data[0] = CMD_R_REGISTER | reg;
+    t.tx_data[1] = 0xFF;
+    spi_device_polling_transmit(dev, &t);
     return t.rx_data[1];
 }
-static void nrf_write_multi(radio_t *r, uint8_t reg, const uint8_t *b, int n) {
-    uint8_t tx[8]; tx[0] = CMD_W_REGISTER | reg;
-    for (int i = 0; i < n; i++) tx[1 + i] = b[i];
-    spi_transaction_t t = { .length = (size_t)((n + 1) * 8), .tx_buffer = tx };
-    cs_lo(r); spi_device_polling_transmit(r->spi, &t); cs_hi(r);
-}
-static void nrf_cmd(radio_t *r, uint8_t c) {
+static void nrf_cmd(spi_device_handle_t dev, uint8_t cmd) {
     spi_transaction_t t = { .flags = SPI_TRANS_USE_TXDATA, .length = 8 };
-    t.tx_data[0] = c;
-    cs_lo(r); spi_device_polling_transmit(r->spi, &t); cs_hi(r);
+    t.tx_data[0] = cmd;
+    spi_device_polling_transmit(dev, &t);
+}
+
+/* ================= tabla de canales (SECUENCIAL) ================= */
+/* Reparto 2..80 entre los tres radios (79/3 = 26):
+ *   NRF2 ->  2..27   NRF1 -> 28..53   NRF3 -> 54..80
+ * El orden es secuencial: cada salto es de 1 MHz y el PLL engancha rapido.
+ * Al cerrar la vuelta se rota el arranque random, para que el patron no sea
+ * siempre el mismo ciclo alineado. */
+static void generar_tabla(radio_t *r) {
+    int idx = (int)(r - radios);
+    int por = JAM_CH_N / NUM_RADIOS;
+    int lo  = JAM_CH_LO + idx * por;
+    int hi  = lo + por - 1;
+    if (idx == NUM_RADIOS - 1) hi = JAM_CH_HI;
+
+    r->ch_lo   = (uint8_t)lo;
+    r->ch_hi   = (uint8_t)hi;
+    r->ch_idx  = (uint32_t)(esp_timer_get_time() % (hi - lo + 1));
+    r->canal   = (uint8_t)(lo + r->ch_idx);
+    r->vueltas = 0;
+}
+
+/* ================= portadora continua ================= */
+/* CE abajo -> RF_CH -> CE alto. El PLL se asienta DURANTE el dwell, con el
+ * carrier ya radiando. No hay que esperarlo con CE abajo. */
+static void cw_up(radio_t *r, uint8_t ch) {
+    ce_lo(r);
+    nrf_write_reg(r->spi, NRF_RF_CH, (uint8_t)(ch & 0x7F));
+    ce_hi(r);
 }
 
 static void jam_enter(radio_t *r) {
-    static const uint8_t dummy[5] = {0,0,0,0,0};
     ce_lo(r);
-    nrf_cmd(r, CMD_FLUSH_TX);
-    nrf_write_reg(r, NRF_EN_AA, 0x00);
-    nrf_write_reg(r, NRF_EN_RXADDR, 0x00);
-    nrf_write_reg(r, NRF_SETUP_AW, 0x03);
-    nrf_write_reg(r, NRF_SETUP_RETR, 0x00);
-    nrf_write_reg(r, NRF_CONFIG, CONFIG_TX);
-    nrf_write_reg(r, NRF_RF_SETUP, RF_SETUP_MAX);
-    nrf_write_multi(r, NRF_TX_ADDR, dummy, 5);
-    nrf_cmd(r, CMD_FLUSH_TX);
-    vTaskDelay(pdMS_TO_TICKS(3));
-    nrf_write_reg(r, NRF_RF_SETUP, RF_SETUP_CW);   /* CONT_WAVE + PLL_LOCK */
-    nrf_write_reg(r, NRF_RF_CH, CH_LO);
-    r->canal = CH_LO;
-    ce_hi(r);                                       /* PA FIJO EN ALTO */
-    bang_arm(r);
+    nrf_cmd(r->spi, CMD_FLUSH_TX);
+    nrf_write_reg(r->spi, NRF_EN_AA, 0x00);
+    nrf_write_reg(r->spi, NRF_EN_RXADDR, 0x00);
+    nrf_write_reg(r->spi, NRF_SETUP_AW, 0x03);
+    nrf_write_reg(r->spi, NRF_SETUP_RETR, 0x00);
+    nrf_write_reg(r->spi, NRF_CONFIG, CONFIG_MODO_TX);
+    nrf_write_reg(r->spi, NRF_RF_SETUP,
+                  (uint8_t)(RF_SETUP_VALOR | RF_CONT_WAVE | RF_PLL_LOCK));
+    generar_tabla(r);
+    cw_up(r, r->canal);
 }
 
-/* ============================ LED ============================ */
-static void led_set(uint8_t rr, uint8_t gg, uint8_t bb) {
-    led_strip_set_pixel(led, 0, rr, gg, bb);
-    led_strip_refresh(led);
-}
-static void arcoiris(int64_t t, uint8_t *r, uint8_t *g, uint8_t *b) {
-    double d = (double)t;
-    double fc = 2.0 * M_PI * d / LED_CICLO_US;
-    double rr = (sin(fc) + 1.0) * 0.5;
-    double gg = (sin(fc + 2.0 * M_PI / 3.0) + 1.0) * 0.5;
-    double bb = (sin(fc + 4.0 * M_PI / 3.0) + 1.0) * 0.5;
-    double fr = 2.0 * M_PI * d / LED_BREATH_US;
-    double br = (double)LED_BRILLO * (LED_BREATH_MIN + (1.0 - LED_BREATH_MIN) * ((sin(fr) + 1.0) * 0.5));
-    *r = (uint8_t)(rr * br + 0.5);
-    *g = (uint8_t)(gg * br + 0.5);
-    *b = (uint8_t)(bb * br + 0.5);
-}
-static void led_update(void) {
-    if (!g_jam_ok) { led_set(0, 0, 0); return; }
-    uint8_t r, g, b;
-    arcoiris(esp_timer_get_time(), &r, &g, &b);
-    led_set(r, g, b);
-}
-static void led_init(void) {
-    led_strip_config_t sc = { .strip_gpio_num = LED_GPIO, .max_leds = 1,
-        .led_model = LED_MODEL_WS2812, .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB };
-    led_strip_rmt_config_t rc = { .clk_src = RMT_CLK_SRC_DEFAULT, .resolution_hz = 10 * 1000 * 1000 };
-    ESP_ERROR_CHECK(led_strip_new_rmt_device(&sc, &rc, &led));
-    led_set(60, 0, 0); vTaskDelay(pdMS_TO_TICKS(100));
-    led_set(0, 60, 0); vTaskDelay(pdMS_TO_TICKS(100));
-    led_set(0, 0, 60); vTaskDelay(pdMS_TO_TICKS(100));
-    led_set(0, 0, 0);
-}
-
-/* ============================ init de bus/radio ============================ */
-static void bus_init(spi_host_device_t h, gpio_num_t sck, gpio_num_t mosi, gpio_num_t miso) {
-    spi_bus_config_t b = { .mosi_io_num = mosi, .miso_io_num = miso, .sclk_io_num = sck,
-        .quadwp_io_num = -1, .quadhd_io_num = -1, .max_transfer_sz = 64 };
-    ESP_ERROR_CHECK(spi_bus_initialize(h, &b, SPI_DMA_DISABLED));
-}
-
-/* Prueba la escalera de reloj de arriba a abajo.  Deja r->spi apuntando al
-   primer reloj con el que el chip responde el eco de RF_CH. */
-static bool radio_add(radio_t *r) {
-    for (int i = 0; i < (int)N_HZ; i++) {
-        spi_device_interface_config_t dc = { .clock_speed_hz = spi_hz_escalera[i],
-            .mode = 0, .spics_io_num = -1, .queue_size = 1 };
-        if (spi_bus_add_device(r->host, &dc, &r->spi) != ESP_OK) continue;
-
-        nrf_write_reg(r, NRF_RF_CH, 0x5A);
-        if (nrf_read_reg(r, NRF_RF_CH) == 0x5A) {
-            if (g_spi_hz == 0 || spi_hz_escalera[i] < g_spi_hz) g_spi_hz = spi_hz_escalera[i];
-            return true;
-        }
-        spi_bus_remove_device(r->spi);
-        r->spi = NULL;
+static inline void jam_hop(radio_t *r) {
+    r->ch_idx++;
+    if (r->ch_idx > (uint32_t)(r->ch_hi - r->ch_lo)) {
+        r->ch_idx = 0;
+        r->vueltas++;
+        /* refresh del CONT_WAVE: los Si24R1 clones se caen solos */
+        nrf_write_reg(r->spi, NRF_RF_SETUP,
+                      (uint8_t)(RF_SETUP_VALOR | RF_CONT_WAVE | RF_PLL_LOCK));
     }
-    return false;
+    uint8_t ch = (uint8_t)(r->ch_lo + r->ch_idx);
+    r->canal = ch;
+    cw_up(r, ch);
+    r->hops++;
+}
+
+/* ================= init ================= */
+static void bus_init(spi_host_device_t host, gpio_num_t sck, gpio_num_t mosi, gpio_num_t miso) {
+    spi_bus_config_t buscfg = {
+        .mosi_io_num = mosi, .miso_io_num = miso, .sclk_io_num = sck,
+        .quadwp_io_num = -1, .quadhd_io_num = -1, .max_transfer_sz = 64,
+    };
+    ESP_ERROR_CHECK(spi_bus_initialize(host, &buscfg, SPI_DMA_CH_AUTO));
 }
 
 static bool radio_init(radio_t *r) {
     gpio_set_direction(r->ce, GPIO_MODE_OUTPUT);
-    gpio_set_direction(r->cs, GPIO_MODE_OUTPUT);
-    GPIO_OUT_W1TC = 1u << (uint32_t)r->ce;
-    GPIO_OUT_W1TS = 1u << (uint32_t)r->cs;
+    gpio_set_level(r->ce, 0);
 
-    gpio_config_t io = { .pin_bit_mask = 1ULL << (uint32_t)r->irq,
-        .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_ENABLE, .intr_type = GPIO_INTR_DISABLE };
-    gpio_config(&io);
+    spi_device_interface_config_t devcfg = {
+        .clock_speed_hz = SPI_HZ, .mode = 0, .spics_io_num = r->cs, .queue_size = 1,
+    };
+    if (spi_bus_add_device(r->host, &devcfg, &r->spi) != ESP_OK) return false;
 
-    r->hw = spi_hw(r->host);
-
-    if (!radio_add(r)) {
-        ESP_LOGE(TAG, "%s NO RESPONDE (CS=%d)", r->nombre, (int)r->cs);
+    nrf_write_reg(r->spi, NRF_RF_CH, 0x5A);
+    if (nrf_read_reg(r->spi, NRF_RF_CH) != 0x5A) {
+        ESP_LOGE(TAG, "%s NO RESPONDE (CS=%d SCK=%d MOSI=%d MISO=%d)",
+                 r->nombre, (int)r->cs, (int)r->sck, (int)r->mosi, (int)r->miso);
         return false;
     }
-    ESP_LOGI(TAG, "%s OK [SPI%d CS=%d CE=%d @%dMHz]",
-             r->nombre, (int)r->host, (int)r->cs, (int)r->ce, g_spi_hz / 1000000);
+    nrf_write_reg(r->spi, NRF_STATUS, 0x70);
+    nrf_cmd(r->spi, CMD_FLUSH_TX);
+    ESP_LOGI(TAG, "%s OK  [SPI%d CS=%d CE=%d]", r->nombre, (int)r->host, (int)r->cs, (int)r->ce);
     return true;
 }
 
-/* ============================ bang autodetect ============================ */
-/* Se prioriza el GPSPI del propio host para no cruzarse entre cores.
-   El otro GPSPI queda como ultimo recurso. */
-static void bang_detectar(radio_t *r) {
-    spi_dev_t *prim = spi_hw(r->host);
-    spi_dev_t *alt  = (prim == &GPSPI2) ? &GPSPI3 : &GPSPI2;
-    spi_dev_t *cand[2] = { prim, alt };
-
-    for (int i = 0; i < 2; i++) {
-        for (int a = 0; a < 3; a++) {
-            g_bang_align = (uint8_t)a;
-            r->hw = cand[i];
-            bang_write(r, CMD_W_REGISTER | NRF_RF_CH, 0x2A);
-            if (nrf_read_reg(r, NRF_RF_CH) == 0x2A) {
-                r->bang_ok = true;
-                ESP_LOGI(TAG, "%s BANG OK: GPSPI%d align=%d", r->nombre, i + 2, a);
-                return;
-            }
-        }
+/* ================= tareas ================= */
+static bool IRAM_ATTR on_alarm(gptimer_handle_t t,
+                               const gptimer_alarm_event_data_t *e, void *ctx) {
+    BaseType_t woken = pdFALSE;
+    for (int i = 0; i < NUM_RADIOS; i++) {
+        if (radios[i].task) vTaskNotifyGiveFromISR(radios[i].task, &woken);
     }
-    r->bang_ok = false;
-    r->hw = prim;
-    ESP_LOGW(TAG, "%s BANG NO: uso driver", r->nombre);
+    return woken == pdTRUE;
 }
 
-/* ============================ lazo caliente ============================ */
-static inline IRAM_ATTR void hop(radio_t *r) {
-    r->k++;
-    /* Refresh del CONT_WAVE: los clones Si24R1 se caen solos del modo CW */
-    if ((r->k % NUM_CANALES) == 0) {
-        if (r->bang_ok) bang_write(r, CMD_W_REGISTER | NRF_RF_SETUP, RF_SETUP_CW);
-        else            nrf_write_reg(r, NRF_RF_SETUP, RF_SETUP_CW);
-    }
-    uint8_t ch = (uint8_t)(CH_LO + (r->fase + r->k) % NUM_CANALES);
-    if (ch == r->canal) return;
-    r->canal = ch;
-    if (r->bang_ok) bang_write(r, CMD_W_REGISTER | NRF_RF_CH, ch);
-    else            nrf_write_reg(r, NRF_RF_CH, ch);
-    r->hops++;
-}
-
-/* core 1: SPI2 -> NRF2 + NRF1 */
-static void IRAM_ATTR jam_loop_a(void *arg) {
-    uint32_t t_yield = cyc();
+static void radio_task(void *arg) {
+    radio_t *r = (radio_t *)arg;
     for (;;) {
-        if (radios[0].spi) hop(&radios[0]);
-        if (radios[1].spi) hop(&radios[1]);
-
-        if (g_dwell) {
-            uint32_t c0 = cyc();
-            while (cyc() - c0 < (uint32_t)g_dwell * CPU_MHZ) { }
-        }
-
-        uint32_t now = cyc();
-        if (now - t_yield >= (uint32_t)YIELD_MS * MS_CYC) { t_yield = now; vTaskDelay(1); }
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        jam_hop(r);
     }
 }
 
-/* telemetria, la corre core 0 junto al radio */
-static void telemetria(void) {
-    static uint32_t p0 = 0, p1 = 0, p2 = 0;
-    static int64_t  t_prev = 0;
+static void dwell_task(void *arg) {
+    size_t idx = 0;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(DWELL_PERIOD_MS));
+        idx = (idx + 1) % DWELL_STEPS;
 
-    int64_t now = esp_timer_get_time();
-    if (t_prev == 0) { t_prev = now; return; }
-    uint32_t dt = (uint32_t)(now - t_prev);
-    t_prev = now;
-    if (dt < 1000) return;
+        gptimer_stop(dwell_timer);
+        g_dwell = dwell_ladder[idx];
+        gptimer_alarm_config_t alarm = {
+            .alarm_count = g_dwell, .reload_count = 0, .flags.auto_reload_on_alarm = true,
+        };
+        gptimer_set_alarm_action(dwell_timer, &alarm);
+        gptimer_start(dwell_timer);
 
-    uint32_t h[NUM_RADIOS] = { radios[0].hops, radios[1].hops, radios[2].hops };
-    uint32_t d[NUM_RADIOS] = { h[0] - p0, h[1] - p1, h[2] - p2 };
-    p0 = h[0]; p1 = h[1]; p2 = h[2];
-
-    uint32_t tot = d[0] + d[1] + d[2];
-    if (!tot) return;
-
-    uint32_t hops_s = (uint32_t)((uint64_t)tot * 1000000ULL / dt);
-    uint32_t us_hop = hops_s ? (1000000UL / (hops_s / NUM_RADIOS ? hops_s / NUM_RADIOS : 1)) : 0;
-    uint32_t revisita = us_hop * NUM_CANALES;
-
-    ESP_LOGI(TAG, "hops/s=%lu | us/hop=%lu | REVISITA=%luus | DUTY=%lu%% | dwell=%u | %s",
-             (unsigned long)hops_s, (unsigned long)us_hop, (unsigned long)revisita,
-             (unsigned long)(us_hop ? (100UL * us_hop / (revisita ? revisita : 1)) : 0),
-             (unsigned)g_dwell,
-             revisita && revisita < 625 ? ">> RAPIDO" : ">> LENTO");
-}
-
-/* core 0: SPI3 -> NRF3 + LED + telemetria */
-static void IRAM_ATTR jam_loop_b(void *arg) {
-    int64_t t_led = esp_timer_get_time();
-    int64_t t_tel = t_led;
-    int64_t t_yield = t_led;
-
-    for (;;) {
-        if (radios[2].spi) hop(&radios[2]);
-
-        if (g_dwell) {
-            uint32_t c0 = cyc();
-            while (cyc() - c0 < (uint32_t)g_dwell * CPU_MHZ) { }
+        int canales = 0, n = 0;
+        for (int i = 0; i < NUM_RADIOS; i++) {
+            if (!radios[i].spi) continue;
+            canales += (radios[i].ch_hi - radios[i].ch_lo + 1);
+            n++;
         }
-
-        int64_t now = esp_timer_get_time();
-        if (now - t_led >= (int64_t)LED_REFRESCO_MS * 1000) { t_led = now; led_update(); }
-        if (now - t_tel >= 2000000)                          { t_tel = now; telemetria(); }
-        if (now - t_yield >= (int64_t)YIELD_MS * 1000)       { t_yield = now; vTaskDelay(1); }
+        int por_radio = n ? canales / n : 0;
+        uint32_t revisita = (uint32_t)por_radio * g_dwell;
+        ESP_LOGI(TAG, "dwell -> %3lu us   revisita ~%lu us   %s",
+                 (unsigned long)g_dwell, (unsigned long)revisita,
+                 revisita < 625 ? ">> REVISITA < SLOT BT" : ">> strike limpio");
+        g_flash = true;
     }
 }
 
-/* ============================ arranque ============================ */
+/* ---------- LED ---------- */
+static void led_set(uint8_t rr, uint8_t gg, uint8_t bb) {
+    led_strip_set_pixel(led, 0, rr, gg, bb);
+    led_strip_refresh(led);
+}
+static void led_init(void) {
+    led_strip_config_t strip_cfg = {
+        .strip_gpio_num = LED_GPIO, .max_leds = 1, .led_model = LED_MODEL_WS2812,
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB, .flags.invert_out = false,
+    };
+    led_strip_rmt_config_t rmt_cfg = {
+        .clk_src = RMT_CLK_SRC_DEFAULT, .resolution_hz = 10 * 1000 * 1000, .flags.with_dma = false,
+    };
+    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &led));
+    led_set(60, 0, 0); vTaskDelay(pdMS_TO_TICKS(150));
+    led_set(0, 60, 0); vTaskDelay(pdMS_TO_TICKS(150));
+    led_set(0, 0, 60); vTaskDelay(pdMS_TO_TICKS(150));
+    led_set(0, 0, 0);
+}
+static void led_task(void *arg) {
+    int64_t ciclo = 9000000;
+    while (1) {
+        if (!g_jam_ok) { led_set(0, 0, 0); vTaskDelay(pdMS_TO_TICKS(200)); continue; }
+        if (g_flash) {
+            g_flash = false;
+            led_set(LED_BRILLO, LED_BRILLO, LED_BRILLO);
+            vTaskDelay(pdMS_TO_TICKS(120));
+            led_set(0, 0, 0);
+            vTaskDelay(pdMS_TO_TICKS(80));
+            continue;
+        }
+        int64_t t = esp_timer_get_time();
+        int hue = (int)((t % ciclo) * 360 / ciclo);
+        int region = hue / 60, f = hue % 60;
+        uint8_t v = LED_BRILLO, r, g, b;
+        int p = (v * (255 - 255 * f / 60)) / 255;
+        int q = (v * (255 - 255 * (60 - f) / 60)) / 255;
+        int u = (v * 255 * f / 60) / 255;
+        switch (region) {
+            case 0: r = v; g = u; b = 0; break;
+            case 1: r = q; g = v; b = 0; break;
+            case 2: r = 0; g = v; b = u; break;
+            case 3: r = 0; g = q; b = v; break;
+            case 4: r = u; g = 0; b = v; break;
+            default: r = v; g = 0; b = p; break;
+        }
+        led_set(r, g, b);
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+/* ---------- timer de dwell ---------- */
+static void gptimer_init(void) {
+    gptimer_config_t cfg = {
+        .clk_src = GPTIMER_CLK_SRC_DEFAULT, .direction = GPTIMER_COUNT_UP, .resolution_hz = 1000000,
+    };
+    ESP_ERROR_CHECK(gptimer_new_timer(&cfg, &dwell_timer));
+    gptimer_event_callbacks_t cbs = { .on_alarm = on_alarm };
+    ESP_ERROR_CHECK(gptimer_register_event_callbacks(dwell_timer, &cbs, NULL));
+    ESP_ERROR_CHECK(gptimer_enable(dwell_timer));
+    gptimer_alarm_config_t alarm = {
+        .alarm_count = g_dwell, .reload_count = 0, .flags.auto_reload_on_alarm = true,
+    };
+    ESP_ERROR_CHECK(gptimer_set_alarm_action(dwell_timer, &alarm));
+}
+
 void app_main(void) {
     led_init();
-    bus_init(SPI2_HOST, GPIO_NUM_12, GPIO_NUM_11, GPIO_NUM_13);
-    bus_init(SPI3_HOST, GPIO_NUM_18, GPIO_NUM_8,  GPIO_NUM_7);
+    bus_init(SPI2_HOST, PIN_SCK2, PIN_MOSI2, PIN_MISO2);
+    bus_init(SPI3_HOST, PIN_SCK3, PIN_MOSI3, PIN_MISO3);
 
     int activos = 0;
-    bool ok[NUM_RADIOS] = {0};
-    for (int i = 0; i < NUM_RADIOS; i++) {
-        if (radio_init(&radios[i])) { ok[i] = true; activos++; }
-    }
+    for (int i = 0; i < NUM_RADIOS; i++) if (radio_init(&radios[i])) activos++;
+
     if (activos == 0) {
-        ESP_LOGE(TAG, "NINGUN NRF responde. Revisa cableado, 3.3V y los 100uF.");
+        ESP_LOGE(TAG, "NINGUN NRF responde. Revisa cableado y 3.3V.");
         for (;;) { led_set(60, 0, 0); vTaskDelay(pdMS_TO_TICKS(200)); }
     }
     if (activos < NUM_RADIOS) ESP_LOGW(TAG, "Solo %d de %d NRF: sigo con los que si", activos, NUM_RADIOS);
 
-    /* fases repartidas parejo entre los radios que quedaron vivos */
-    int idx = 0;
     for (int i = 0; i < NUM_RADIOS; i++) {
-        if (!ok[i]) continue;
-        radios[i].fase = (uint8_t)((NUM_CANALES / activos) * idx);
-        idx++;
+        if (!radios[i].spi) continue;
+        jam_enter(&radios[i]);
+        xTaskCreatePinnedToCore(radio_task, radios[i].nombre, 3072, &radios[i],
+                                configMAX_PRIORITIES - 1, &radios[i].task,
+                                (BaseType_t)radios[i].core);
     }
 
-    for (int i = 0; i < NUM_RADIOS; i++) {
-        if (!ok[i]) continue;
-        jam_enter(&radios[i]);
-        bang_detectar(&radios[i]);
-        nrf_write_reg(&radios[i], NRF_RF_CH, CH_LO);
-        radios[i].canal = CH_LO;
-        bang_arm(&radios[i]);
-    }
+    gptimer_init();
+    gptimer_start(dwell_timer);
 
     g_jam_ok = (activos == NUM_RADIOS);
+    xTaskCreate(led_task,   "led",   2048, NULL, 3, NULL);
+    xTaskCreate(dwell_task, "dwell", 3072, NULL, 2, NULL);
 
-    xTaskCreatePinnedToCore(jam_loop_a, "jamA", 4096, NULL, configMAX_PRIORITIES - 1, NULL, 1);
-    xTaskCreatePinnedToCore(jam_loop_b, "jamB", 4096, NULL, configMAX_PRIORITIES - 1, NULL, 0);
+    ESP_LOGI(TAG, "MARTILLO ON · %d radio(s) · canales %d..%d · orden SECUENCIAL · dwell %lu us",
+             activos, JAM_CH_LO, JAM_CH_HI, (unsigned long)g_dwell);
 
-    ESP_LOGI(TAG, "BT-KILLER | %d NRF @%dMHz | %d canales | dwell=%u | DMA OFF | CE fijo",
-             activos, g_spi_hz / 1000000, NUM_CANALES, (unsigned)g_dwell);
-    ESP_LOGI(TAG, "DUTY=3/%d. Revisita objetivo <625us. Subir duty = menos canales.", NUM_CANALES);
-    vTaskDelay(portMAX_DELAY);
+    uint32_t prev[NUM_RADIOS] = {0};
+    int64_t  tprev[NUM_RADIOS] = {0};
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        int64_t now = esp_timer_get_time();
+        for (int i = 0; i < NUM_RADIOS; i++) {
+            radio_t *r = &radios[i];
+            if (!r->spi) continue;
+            uint32_t dh = r->hops - prev[i];
+            uint32_t us_hop = dh ? (uint32_t)((now - tprev[i]) / dh) : 0;
+            prev[i] = r->hops; tprev[i] = now;
+            int nch = r->ch_hi - r->ch_lo + 1;
+            uint32_t rev = us_hop * (uint32_t)nch;
+            ESP_LOGI(TAG, "%s %4lu saltos/s (%lu us/hop) ch=%2u rango=%u..%u revisita=%luus vueltas=%lu dwell=%lu",
+                     r->nombre, (unsigned long)(dh / 2), (unsigned long)us_hop,
+                     (unsigned)r->canal, (unsigned)r->ch_lo, (unsigned)r->ch_hi,
+                     (unsigned long)rev, (unsigned long)r->vueltas, (unsigned long)g_dwell);
+        }
+    }
 }
