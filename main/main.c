@@ -69,7 +69,7 @@ static const char *TAG = "BTKILL";
 #define NUM_CANALES  (CH_HI - CH_LO + 1)    /* 79 canales BT/BLE */
 
 #define NUM_RADIOS   3
-#define DWELL_US     10        /* 0 = maxima velocidad. Ver KNOBS arriba. */
+#define DWELL_US     180        /* 0 = maxima velocidad. Ver KNOBS arriba. */
 #define YIELD_MS     1000      /* cesion de tick, 1 vez por segundo */
 
 /* Escalera de reloj SPI: se prueba de arriba a abajo hasta que el chip
