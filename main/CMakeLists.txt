@@ -15,6 +15,7 @@ idf_component_register(
         esp_netif
         esp_event
         esp_wifi
+        esp_driver_gptimer
         led_strip
 )
 
