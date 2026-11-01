@@ -69,6 +69,7 @@
 #include "esp_rom_sys.h"
 #include "soc/spi_struct.h"
 #include "led_strip.h"
+#include "esp_heap_caps.h"
 
 static const char *TAG = "CAZA";
 
@@ -162,6 +163,18 @@ static tablas_t *g_tab = &g_buf[0];
 /* ===================== estado del scan ===================== */
 static uint8_t  g_cuenta[NUM_CANALES];
 static uint16_t g_score[NUM_CANALES];     /* 1/256 de unidad */
+/* Historia de escaneos en PSRAM (8 MB disponibles).
+ * El score exponencial recuerda ~SCORE_DEC scans. Con un anillo de HIST_SCANS
+ * se tienen estadisticas EXACTAS: cuantos scans vio el canal saturado (WiFi)
+ * vs cuantos lo vio con rafaga (piconet). Es la separacion que el score no
+ * puede hacer bien. 79 x 256 = 20 KB de 8 MB. */
+#define HIST_SCANS   256                  /* ~5 min a 1.2 s por scan */
+#define SAT_FRAC_MAX 30                   /* >30% de scans saturado = WiFi */
+#define PRES_FRAC_MIN 8                   /* <8% de scans con rafaga = ruido */
+static uint8_t  *s_hist = NULL;           /* NUM_CANALES x HIST_SCANS */
+static uint16_t  s_hist_idx = 0;
+static uint16_t  s_hist_fill = 0;
+
 static int      scan_ch = 0;
 static uint8_t  scan_pasada = 0;
 static uint8_t  g_scans = 0;
@@ -371,6 +384,39 @@ static void bang_detectar(radio_t *r) {
 }
 
 /* ===================== tablas ===================== */
+static void hist_init(void) {
+    s_hist = heap_caps_malloc((size_t)NUM_CANALES * HIST_SCANS, MALLOC_CAP_SPIRAM);
+    if (!s_hist) {
+        ESP_LOGW(TAG, "PSRAM: sin memoria para historia, uso el score simple");
+        return;
+    }
+    memset(s_hist, 0, (size_t)NUM_CANALES * HIST_SCANS);
+    ESP_LOGI(TAG, "PSRAM: %d scans x %d canales = %d KB (de 8 MB)",
+             HIST_SCANS, NUM_CANALES,
+             (int)(((size_t)NUM_CANALES * HIST_SCANS) / 1024));
+}
+
+static inline void hist_push(const uint8_t *cuenta) {
+    if (!s_hist) return;
+    for (int c = 0; c < NUM_CANALES; c++)
+        s_hist[(size_t)c * HIST_SCANS + s_hist_idx] = cuenta[c];
+    s_hist_idx = (uint16_t)((s_hist_idx + 1) % HIST_SCANS);
+    if (s_hist_fill < HIST_SCANS) s_hist_fill++;
+}
+
+/* Estadisticas exactas sobre la ventana completa. */
+static inline void hist_stats(int c, int *sat, int *pres, int *total) {
+    *sat = 0; *pres = 0;
+    *total = s_hist_fill ? s_hist_fill : 1;
+    if (!s_hist) return;
+    for (int k = 0; k < s_hist_fill; k++) {
+        int slot = (int)((s_hist_idx + k) % HIST_SCANS);   /* mas viejo primero */
+        uint8_t h = s_hist[(size_t)c * HIST_SCANS + slot];
+        if (h >= SCAN_MUESTRAS) (*sat)++;
+        else if (h > 0)         (*pres)++;
+    }
+}
+
 static void IRAM_ATTR tablas_barrido(tablas_t *t) {
     int vivos = 0;
     for (int i = 0; i < NUM_RADIOS; i++) if (radios[i].vivo) vivos++;
@@ -423,10 +469,19 @@ static void IRAM_ATTR tablas_caza(tablas_t *t, int n_max) {
 
     for (int c = 0; c < NUM_CANALES; c++) {
         if (g_cuenta[c] >= SCAN_MUESTRAS) continue;      /* saturado este scan */
-        uint32_t sc = g_score[c] >> SCORE_SHIFT;
-        if (sc < SCORE_MIN) continue;                     /* sin confianza */
-        if (sc >= SAT_MIN) continue;                      /* denso: no es BT */
-        uint16_t rk = (uint16_t)((g_score[c] >> 4) + g_cuenta[c]);
+        uint16_t rk;
+        if (s_hist && s_hist_fill >= WARMUP_SCANS) {
+            int sat, pres, total;
+            hist_stats(c, &sat, &pres, &total);
+            if (sat * 100 > total * SAT_FRAC_MAX)   continue;  /* WiFi/fijo */
+            if (pres * 100 < total * PRES_FRAC_MIN) continue;  /* ruido */
+            rk = (uint16_t)(pres * 4 + g_cuenta[c]);
+        } else {
+            uint32_t sc = g_score[c] >> SCORE_SHIFT;
+            if (sc < SCORE_MIN) continue;
+            if (sc >= SAT_MIN) continue;
+            rk = (uint16_t)((g_score[c] >> 4) + g_cuenta[c]);
+        }
         insertar(elig, rank, &ne, n_max, (uint8_t)(CH_LO + c), rk);
     }
     nraf = ne;
@@ -554,6 +609,7 @@ static inline void scan_fin(void) {
         radio_devolver_tx(&radios[g_scan_idx]);
 
     score_actualizar();
+    hist_push(g_cuenta);
     if (g_scans < 255) g_scans++;
     g_scan_idx = -1;
 
@@ -800,6 +856,8 @@ void app_main(void) {
 
     g_jam_ok = (activos > 0);
     g_vivos = activos;
+
+    hist_init();
 
     test_piso_ruido();
 
