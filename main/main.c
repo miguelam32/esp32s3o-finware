@@ -120,6 +120,7 @@ static inline __attribute__((always_inline)) uint32_t cyc(void) {
 #define LED_BRILLO  51
 static led_strip_handle_t led;
 static volatile bool g_jam_ok = false;
+static volatile int  g_vivos = 0;   /* radios vivos reales, para el LED */
 static volatile bool g_flash  = false;
 static volatile bool g_cazando = false;
 static volatile bool g_quiet  = false;
@@ -582,12 +583,25 @@ static void led_init(void) {
     led_set(0, 0, 0);
 }
 static void led_update(void) {
-    if (!g_jam_ok) { led_set(0, 0, 0); return; }
+    /* 0 radios: rojo fijo = muerto del todo */
+    if (g_vivos == 0) { led_set(LED_BRILLO, 0, 0); return; }
+    /* blink blanco en cada recalculo del mapa */
     if (g_flash)   { g_flash = false; led_set(LED_BRILLO, LED_BRILLO, LED_BRILLO); return; }
     int64_t t = esp_timer_get_time();
-    int fase = (int)((t % 1500000) * 2 / 1500000);
-    if (g_cazando) led_set(0, LED_BRILLO, (uint8_t)(LED_BRILLO / 3 * fase));
-    else           led_set(0, 0, LED_BRILLO);
+    /* CAZA activa: verde que pulsa (piconet detectado, duty alto) */
+    if (g_cazando) {
+        int fase = (int)((t % 1500000) * 2 / 1500000);
+        led_set(0, LED_BRILLO, (uint8_t)(LED_BRILLO / 3 * fase));
+        return;
+    }
+    /* barrido con radios degradados: ambar pulsando lento */
+    if (g_vivos < NUM_RADIOS) {
+        int fase = (int)((t % 3000000) * 2 / 3000000);
+        led_set((uint8_t)(LED_BRILLO * fase / 2), (uint8_t)(LED_BRILLO * fase / 3), 0);
+        return;
+    }
+    /* barrido completo: azul */
+    led_set(0, 0, LED_BRILLO);
 }
 
 /* ===================== tasks ===================== */
@@ -784,7 +798,8 @@ void app_main(void) {
     tablas_barrido(&g_buf[1]);
     __atomic_store_n(&g_tab, &g_buf[0], __ATOMIC_RELEASE);
 
-    g_jam_ok = (activos == NUM_RADIOS);
+    g_jam_ok = (activos > 0);
+    g_vivos = activos;
 
     test_piso_ruido();
 
