@@ -16,8 +16,7 @@
  * El test de 6 nRF (que pasa los 6 a 16 MHz) hace park_pins() para LOS SEIS
  * radios ANTES de spi_bus_initialize. Esta version hace lo mismo.
  *
- * ====== QUE HACE ======
- * 1. Arranca en BARRIDO: los 6 radios cubren los 79 canales de BT Classic.
+ * ====== QUE HACE === * 1. Arranca en BARRIDO: los 6 radios cubren los 79 canales de BT Classic.
  * 2. Cada ~1.2 s hace una VENTANA DE SILENCIO: baja el CE de los 6 radios (el
  *    PA/LNA se apaga), y un radio prestado escanea los 79 canales con el RPD.
  * 3. Acumula confianza por canal (score con decaimiento real + histograma PSRAM).
