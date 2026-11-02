@@ -1,563 +1,865 @@
 /*
- * Test de 6x nRF24L01+ en ESP32-S3 N16R8 (ESP-IDF 5.x / 6.x)
+ * main.c — CAZADOR v8.1 — 6x nRF24L01+ PA/LNA — ESP32-S3 N16R8 — ESP-IDF v6.0.3
  *
- * Fase 1 (SPI): por cada radio y por cada velocidad (16, 10, 8, 4, 1 MHz)
- *               escribe/lee de vuelta registros con valores aleatorios.
- * Fase 2 (RF) : todos contra todos (30 enlaces), -18 dBm.
- * LED GPIO48  : amarillo = probando
- *               arcoiris = los 6 radios pasan SPI y TX/RX
- *               parpadeos verdes = radios OK, rojos = radios con falla
+ * SPI2 (SCK 12, MOSI 11, MISO 13): NRF1(CE 4 CS 10) NRF2(CE 5 CS 9)  NRF3(CE 6 CS 14)
+ * SPI3 (SCK 18, MOSI 8,  MISO 7):  NRF4(CE 1 CS 21) NRF5(CE 15 CS 16) NRF6(CE 17 CS 38)
+ * WS2812 en GPIO 48.
  *
- * main/CMakeLists.txt:
- *   idf_component_register(SRCS "main.c"
- *                          INCLUDE_DIRS "."
- *                          REQUIRES esp_driver_spi esp_driver_gpio esp_driver_rmt)
+ * ====== FIX v8.1: PARK DE PINES ANTES DE TOCAR SPI ======
+ * v8 configuraba el CS/CE de cada radio DENTRO de su propio radio_init, justo
+ * antes de escribir por SPI. Consecuencia: cuando radio_init(NRF1) hace su
+ * primera transaccion, los CS de NRF2..NRF6 siguen sin configurar (estado
+ * residual del bootloader: flotando o en bajo). Un CS flotante que cae a bajo
+ * habilita ese nRF y DRIVEA MISO a la vez que NRF1 -> colision en el bus -> el
+ * readback devuelve basura -> "NO RESPONDE" falso.
+ *
+ * El test de 6 nRF (que pasa los 6 a 16 MHz) hace park_pins() para LOS SEIS
+ * radios ANTES de spi_bus_initialize. Esta version hace lo mismo.
+ *
+ * ====== QUE HACE ======
+ * 1. Arranca en BARRIDO: los 6 radios cubren los 79 canales de BT Classic.
+ * 2. Cada ~1.2 s hace una VENTANA DE SILENCIO: baja el CE de los 6 radios (el
+ *    PA/LNA se apaga), y un radio prestado escanea los 79 canales con el RPD.
+ * 3. Acumula confianza por canal (score con decaimiento real + histograma PSRAM).
+ * 4. Cuando el mapa converge, pasa a CAZA: los 6 radios martillan SOLO los
+ *    canales que el detector dice que son del piconet.
+ * 5. Si el mapa se queda sin candidatos, vuelve a BARRIDO. Nunca para.
+ *
+ * ====== POR QUE LA VENTANA DE SILENCIO ======
+ * El escaner esta a centimetros de 5 transmisores de +18 dBm. Con 30-40 dB de
+ * aislamiento llegan -17 dBm a su antena: 47 dB POR ENCIMA del umbral del RPD
+ * (-64 dBm). El rechazo de canal adyacente del GFSK es pobre, la fuga alcanza
+ * ~30 canales. Sin ventana el mapa sale TODO saturado -> BARRIDO para siempre.
+ *
+ * ====== SCORE EN PUNTO FIJO ======
+ * s = score + cuenta; s -= s/DEC. Con division ENTERA y DEC=24, cualquier score
+ * entre 1 y 23 NUNCA decae. Guardado en 1/256 el decremento existe siempre.
+ *
+ * ====== GEOMETRIA ======
+ * gap = (L-1)*d. Un paquete de duracion T cae en una ventana de golpeo
+ * garantizada si T > gap. d=320 y GAP_MAX=1200 -> L=4, 24 canales, gap 960us.
  */
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_log.h"
-#include "esp_random.h"
-#include "esp_rom_sys.h"
-#include "driver/gpio.h"
 #include "driver/spi_master.h"
-#include "driver/rmt_tx.h"
-#include "driver/rmt_encoder.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_rom_sys.h"
+#include "soc/spi_struct.h"
+#include "led_strip.h"
+#include "esp_heap_caps.h"
 
-static const char *TAG = "NRF_TEST";
+static const char *TAG = "CAZA";
 
-/* ====================== CONFIG ====================== */
-#define TEST_SPI_HZ      16000000
-#define REG_ITERS        300
-#define RF_PKTS          10
-#define RF_CHANNEL       76
-#define RF_SETUP_VAL     0x00       /* 1 Mbps, -18 dBm */
-#define LED_GPIO         48
-#define RESULT_SHOW_MS   5000
+/* ===================== CONFIG ===================== */
+#define CH_LO        2
+#define CH_HI        80
+#define NUM_CANALES  (CH_HI - CH_LO + 1)      /* 79 */
+#define NUM_RADIOS   6
 
-#define NUM_NRF          6
+#define DWELL_US     220u        /* > 130us: PLL engancha, potencia plena */
 
+#define PAQUETE_DH3  1622u       /* duracion real de paquete DH3 */
+#define PAQUETE_DH5  2870u       /* duracion real de paquete DH5 (BR) */
+
+#define SCAN_MUESTRAS  3         /* pasadas completas por ventana */
+#define REESCANEO_MS   1200      /* cada cuanto se escanea */
+#define SCAN_HARD_MS   900       /* techo duro; solo corta en frontera de pasada */
+
+/* Score en 1/256 de unidad (punto fijo). */
+#define SCORE_SHIFT   8
+#define SCORE_ONE     (1u << SCORE_SHIFT)
+
+/* BT~3.6 · ruido~0.72 · WiFi~61 */
+#define SCORE_DEC      24
+#define SCORE_MIN      2         /* entre ruido y BT */
+#define SAT_MIN        12        /* entre BT y WiFi */
+
+#define WARMUP_SCANS   12
+
+#define SPI_HZ_RAPIDO (16 * 1000 * 1000)
+#define SPI_HZ_SEGURO (10 * 1000 * 1000)
+
+#define CPU_MHZ      240u
+#define CEDE_MS      2000
+
+/* gap = (L-1)*d < GAP_MAX. 1200 deja 422us de margen sobre el DH3. */
+#define GAP_MAX_US   1200u
+#define L_MAX  ((GAP_MAX_US / DWELL_US) + 1u)
+#define N_MAX  ((NUM_RADIOS * L_MAX) < NUM_CANALES ? (NUM_RADIOS * L_MAX) : NUM_CANALES)
+#define MAX_TAB (N_MAX + 2)
+
+/* ===================== tiempo ===================== */
+static inline __attribute__((always_inline)) uint32_t cyc(void) {
+    uint32_t c; __asm__ __volatile__("rsr.ccount %0" : "=a"(c)); return c;
+}
+
+/* ===================== LED ===================== */
+#define LED_GPIO    GPIO_NUM_48
+#define LED_BRILLO  51
+static led_strip_handle_t led;
+static volatile bool g_jam_ok = false;
+static volatile int  g_vivos = 0;
+static volatile bool g_flash  = false;
+static volatile bool g_cazando = false;
+static volatile bool g_quiet  = false;
+
+/* ===================== nRF24 ===================== */
+#define NRF_CONFIG     0x00
+#define NRF_EN_AA      0x01
+#define NRF_EN_RXADDR  0x02
+#define NRF_SETUP_AW   0x03
+#define NRF_SETUP_RETR 0x04
+#define NRF_RF_CH      0x05
+#define NRF_RF_SETUP   0x06
+#define NRF_STATUS     0x07
+#define NRF_RPD        0x09
+#define NRF_TX_ADDR    0x10
+
+#define CMD_R_REGISTER 0x00
+#define CMD_W_REGISTER 0x20
+#define CMD_FLUSH_TX   0xE1
+
+#define RF_CONT_WAVE (1u << 7)
+#define RF_PLL_LOCK  (1u << 4)
+#define RF_SETUP_MAX 0x0E
+#define RF_SETUP_CW  (RF_SETUP_MAX | RF_CONT_WAVE | RF_PLL_LOCK)
+#define CONFIG_TX    0x0E
+#define CONFIG_RX    0x0F
+
+/* ===================== tablas (doble buffer) ===================== */
 typedef struct {
-    const char *name;
+    uint8_t ch[NUM_RADIOS][MAX_TAB];
+    uint8_t len[NUM_RADIOS];
+    uint8_t n_total;
+    uint8_t n_rafaga;
+} tablas_t;
+
+static tablas_t g_buf[2];
+static tablas_t *g_tab = &g_buf[0];
+
+/* ===================== estado del scan ===================== */
+static uint8_t  g_cuenta[NUM_CANALES];
+static uint16_t g_score[NUM_CANALES];     /* 1/256 de unidad */
+#define HIST_SCANS   256                  /* ~5 min a 1.2 s por scan */
+#define SAT_FRAC_MAX 30                   /* >30% saturado = WiFi */
+#define PRES_FRAC_MIN 8                   /* <8% con rafaga = ruido */
+static uint8_t  *s_hist = NULL;
+static uint16_t  s_hist_idx = 0;
+static uint16_t  s_hist_fill = 0;
+
+static int      scan_ch = 0;
+static uint8_t  scan_pasada = 0;
+static uint8_t  g_scans = 0;
+static bool     scan_activo = false;
+static int64_t  scan_t0 = 0;
+static int      scan_radio_idx = 5;
+static volatile int g_scan_idx = -1;
+static volatile uint32_t g_ventana_us = 0;
+
+/* ===================== radios ===================== */
+typedef struct {
+    const char *nombre;
     spi_host_device_t host;
-    int ce;
-    int cs;
-    spi_device_handle_t dev;
-    int cur_hz;
-    int best_hz;
-    int errs[8];
-    bool reg_ok;
-    int tx_ok, rx_ok;
-    bool alive;
-} nrf_t;
+    gpio_num_t ce, cs, sck, mosi, miso;
+    bool cs_alto;
+    spi_device_handle_t spi;
+    spi_dev_t *hw;
+    uint8_t  idx;
+    uint8_t  canal;
+    uint32_t vueltas;
+    volatile uint32_t hops;
+    bool bang_ok;
+    bool bang_sucio;
+    bool vivo;
+} radio_t;
 
-static nrf_t nrf[NUM_NRF] = {
-    { .name = "NRF1", .host = SPI2_HOST, .ce = 4,  .cs = 10 },
-    { .name = "NRF2", .host = SPI2_HOST, .ce = 5,  .cs = 9  },
-    { .name = "NRF3", .host = SPI2_HOST, .ce = 6,  .cs = 14 },
-    { .name = "NRF4", .host = SPI3_HOST, .ce = 1,  .cs = 21 },
-    { .name = "NRF5", .host = SPI3_HOST, .ce = 15, .cs = 16 },
-    { .name = "NRF6", .host = SPI3_HOST, .ce = 17, .cs = 38 },
+static radio_t radios[NUM_RADIOS] = {
+    { .nombre="NRF1", .host=SPI2_HOST, .ce=GPIO_NUM_4,  .cs=GPIO_NUM_10,
+      .sck=GPIO_NUM_12, .mosi=GPIO_NUM_11, .miso=GPIO_NUM_13 },
+    { .nombre="NRF2", .host=SPI2_HOST, .ce=GPIO_NUM_5,  .cs=GPIO_NUM_9,
+      .sck=GPIO_NUM_12, .mosi=GPIO_NUM_11, .miso=GPIO_NUM_13 },
+    { .nombre="NRF3", .host=SPI2_HOST, .ce=GPIO_NUM_6,  .cs=GPIO_NUM_14,
+      .sck=GPIO_NUM_12, .mosi=GPIO_NUM_11, .miso=GPIO_NUM_13 },
+    { .nombre="NRF4", .host=SPI3_HOST, .ce=GPIO_NUM_1,  .cs=GPIO_NUM_21,
+      .sck=GPIO_NUM_18, .mosi=GPIO_NUM_8,  .miso=GPIO_NUM_7  },
+    { .nombre="NRF5", .host=SPI3_HOST, .ce=GPIO_NUM_15, .cs=GPIO_NUM_16,
+      .sck=GPIO_NUM_18, .mosi=GPIO_NUM_8,  .miso=GPIO_NUM_7  },
+    { .nombre="NRF6", .host=SPI3_HOST, .ce=GPIO_NUM_17, .cs=GPIO_NUM_38,
+      .sck=GPIO_NUM_18, .mosi=GPIO_NUM_8,  .miso=GPIO_NUM_7  },
 };
 
-/* bus: SCK, MOSI, MISO */
-static const struct { spi_host_device_t host; int sck, mosi, miso; } buses[] = {
-    { SPI2_HOST, 12, 11, 13 },
-    { SPI3_HOST, 18, 8,  7  },
-};
+static volatile uint32_t g_dwell = DWELL_US;
+static uint8_t           g_bang_align = 0;
+static int               g_spi_hz = SPI_HZ_RAPIDO;
 
-static const int speeds[] = { 16000000, 10000000, 8000000, 4000000, 1000000 };
-#define NUM_SPEEDS (sizeof(speeds) / sizeof(speeds[0]))
+/* GPIO 0..31 -> OUT_W1TS/W1TC ; GPIO 32..46 -> OUT1_* */
+#define GPIO_OUT_W1TS  (*(volatile uint32_t *)0x60004008u)
+#define GPIO_OUT_W1TC  (*(volatile uint32_t *)0x6000400Cu)
+#define GPIO_OUT1_W1TS (*(volatile uint32_t *)0x60004014u)
+#define GPIO_OUT1_W1TC (*(volatile uint32_t *)0x60004018u)
 
-/* ====================== nRF24 ====================== */
-#define R_REGISTER   0x00
-#define W_REGISTER   0x20
-#define R_RX_PAYLOAD 0x61
-#define W_TX_PAYLOAD 0xA0
-#define FLUSH_TX     0xE1
-#define FLUSH_RX     0xE2
-#define NOP          0xFF
-
-#define REG_CONFIG      0x00
-#define REG_EN_AA       0x01
-#define REG_EN_RXADDR   0x02
-#define REG_SETUP_AW    0x03
-#define REG_SETUP_RETR  0x04
-#define REG_RF_CH       0x05
-#define REG_RF_SETUP    0x06
-#define REG_STATUS      0x07
-#define REG_RX_ADDR_P0  0x0A
-#define REG_TX_ADDR     0x10
-#define REG_RX_PW_P0    0x11
-#define REG_FIFO_STATUS 0x17
-
-#define CFG_PWR_UP   0x02
-#define CFG_PRIM_RX  0x01
-#define CFG_EN_CRC   0x08
-
-#define ST_RX_DR     0x40
-#define ST_TX_DS     0x20
-#define ST_MAX_RT    0x10
-
-/* CS en alto y CE en bajo para que ningun radio ensucie el MISO compartido */
-static void park_pins(nrf_t *r)
-{
-    gpio_reset_pin(r->cs);
-    gpio_set_direction(r->cs, GPIO_MODE_OUTPUT);
-    gpio_set_level(r->cs, 1);
-    gpio_reset_pin(r->ce);
-    gpio_set_direction(r->ce, GPIO_MODE_OUTPUT);
-    gpio_set_level(r->ce, 0);
+static inline void ce_hi(radio_t *r) {
+    if ((uint32_t)r->ce >= 32) GPIO_OUT1_W1TS = 1u << ((uint32_t)r->ce - 32);
+    else                       GPIO_OUT_W1TS  = 1u << (uint32_t)r->ce;
+}
+static inline void ce_lo(radio_t *r) {
+    if ((uint32_t)r->ce >= 32) GPIO_OUT1_W1TC = 1u << ((uint32_t)r->ce - 32);
+    else                       GPIO_OUT_W1TC  = 1u << (uint32_t)r->ce;
+}
+static inline void cs_lo(radio_t *r) {
+    if (r->cs_alto) GPIO_OUT1_W1TC = 1u << ((uint32_t)r->cs - 32);
+    else            GPIO_OUT_W1TC  = 1u << (uint32_t)r->cs;
+}
+static inline void cs_hi(radio_t *r) {
+    if (r->cs_alto) GPIO_OUT1_W1TS = 1u << ((uint32_t)r->cs - 32);
+    else            GPIO_OUT_W1TS  = 1u << (uint32_t)r->cs;
 }
 
-static esp_err_t nrf_open(nrf_t *r, int hz)
-{
+/* ===================== SPI directo (bang) ===================== */
+static inline spi_dev_t *spi_hw(spi_host_device_t h) {
+    return (h == SPI2_HOST) ? &GPSPI2 : &GPSPI3;
+}
+#define BANG_W(c,v) (g_bang_align == 0 ? (((uint32_t)(c)<<24)|((uint32_t)(v)<<16)) : \
+                    g_bang_align == 1 ? (((uint32_t)(c)<<8)|(uint32_t)(v))         : \
+                                        (((uint32_t)(c))|((uint32_t)(v)<<8)))
+
+static void IRAM_ATTR bang_arm(radio_t *r) {
+    spi_dev_t *hw = r->hw;
+    hw->user.usr_mosi = 1;  hw->user.usr_miso = 0;
+    hw->user.usr_addr = 0;  hw->user.usr_command = 0;  hw->user.usr_dummy = 0;
+    hw->dma_conf.dma_tx_ena = 0;  hw->dma_conf.dma_rx_ena = 0;
+    hw->ms_dlen.ms_data_bitlen = 15;
+}
+
+static void marcar_sucio(spi_host_device_t h) {
+    for (int i = 0; i < NUM_RADIOS; i++)
+        if (radios[i].vivo && radios[i].host == h) radios[i].bang_sucio = true;
+}
+
+static inline IRAM_ATTR void bang_write(radio_t *r, uint8_t cmd, uint8_t val) {
+    if (r->bang_sucio) { bang_arm(r); r->bang_sucio = false; }
+    spi_dev_t *hw = r->hw;
+    cs_lo(r);
+    hw->data_buf[0] = BANG_W(cmd, val);
+    hw->cmd.usr = 1;
+    uint32_t g = 100000;
+    while (hw->cmd.usr && --g) { }
+    cs_hi(r);
+}
+
+/* ===================== SPI por driver ===================== */
+static void nrf_write_reg(radio_t *r, uint8_t reg, uint8_t val) {
+    spi_transaction_t t = { .flags = SPI_TRANS_USE_TXDATA, .length = 16 };
+    t.tx_data[0] = CMD_W_REGISTER | reg;  t.tx_data[1] = val;
+    cs_lo(r); spi_device_polling_transmit(r->spi, &t); cs_hi(r);
+    marcar_sucio(r->host);
+}
+static uint8_t nrf_read_reg(radio_t *r, uint8_t reg) {
+    spi_transaction_t t = { .flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA, .length = 16 };
+    t.tx_data[0] = CMD_R_REGISTER | reg;  t.tx_data[1] = 0xFF;
+    cs_lo(r); spi_device_polling_transmit(r->spi, &t); cs_hi(r);
+    marcar_sucio(r->host);
+    return t.rx_data[1];
+}
+static void nrf_write_multi(radio_t *r, uint8_t reg, const uint8_t *b, int n) {
+    uint8_t tx[8]; tx[0] = CMD_W_REGISTER | reg;
+    for (int i = 0; i < n; i++) tx[1 + i] = b[i];
+    spi_transaction_t t = { .length = (size_t)((n + 1) * 8), .tx_buffer = tx };
+    cs_lo(r); spi_device_polling_transmit(r->spi, &t); cs_hi(r);
+    marcar_sucio(r->host);
+}
+static void nrf_cmd(radio_t *r, uint8_t c) {
+    spi_transaction_t t = { .flags = SPI_TRANS_USE_TXDATA, .length = 8 };
+    t.tx_data[0] = c;
+    cs_lo(r); spi_device_polling_transmit(r->spi, &t); cs_hi(r);
+    marcar_sucio(r->host);
+}
+
+/* ===================== init ===================== */
+static void bus_init(spi_host_device_t host, gpio_num_t sck, gpio_num_t mosi, gpio_num_t miso) {
+    spi_bus_config_t buscfg = {
+        .mosi_io_num = mosi, .miso_io_num = miso, .sclk_io_num = sck,
+        .quadwp_io_num = -1, .quadhd_io_num = -1, .max_transfer_sz = 64,
+    };
+    ESP_ERROR_CHECK(spi_bus_initialize(host, &buscfg, SPI_DMA_DISABLED));
+}
+
+/* FIX v8.1: park de LOS SEIS radios antes de que exista cualquier transaccion
+ * SPI. gpio_reset_pin limpia el mux/pull que dejo el bootloader; sin el, un CS
+ * puede quedar flotando o en bajo y su nRF drivea MISO durante la escritura de
+ * otro -> colision -> falso "NO RESPONDE". */
+static void park_all_pins(void) {
+    for (int i = 0; i < NUM_RADIOS; i++) {
+        radio_t *r = &radios[i];
+        r->cs_alto = ((uint32_t)r->cs >= 32);
+
+        gpio_reset_pin(r->ce);
+        gpio_set_direction(r->ce, GPIO_MODE_OUTPUT);
+        gpio_set_level(r->ce, 0);          /* CE bajo: nadie emite */
+
+        gpio_reset_pin(r->cs);
+        gpio_set_direction(r->cs, GPIO_MODE_OUTPUT);
+        gpio_set_level(r->cs, 1);          /* CS alto: nadie ensucia MISO */
+
+        r->hw = spi_hw(r->host);
+    }
+    ESP_LOGI(TAG, "Pines estacionados: 6x CS alto, 6x CE bajo");
+}
+
+static bool radio_add(radio_t *r, int hz) {
     spi_device_interface_config_t dc = {
-        .clock_speed_hz = hz,
-        .mode = 0,
-        .spics_io_num = r->cs,
-        .queue_size = 1,
+        .clock_speed_hz = hz, .mode = 0, .spics_io_num = -1, .queue_size = 1,
     };
-    esp_err_t e = spi_bus_add_device(r->host, &dc, &r->dev);
-    if (e == ESP_OK) r->cur_hz = hz;
-    return e;
+    if (spi_bus_add_device(r->host, &dc, &r->spi) != ESP_OK) return false;
+    nrf_write_reg(r, NRF_RF_CH, 0x5A);
+    return nrf_read_reg(r, NRF_RF_CH) == 0x5A;
 }
 
-static void nrf_close(nrf_t *r)
-{
-    if (r->dev) {
-        spi_bus_remove_device(r->dev);
-        r->dev = NULL;
+static bool radio_init(radio_t *r) {
+    /* Los pines ya estan estacionados por park_all_pins(). Solo fijar estado. */
+    ce_lo(r);
+    cs_hi(r);
+    r->hw = spi_hw(r->host);
+
+    /* nRF24L01+ power-on reset: el mapa de registros no es confiable durante
+     * el arranque. Reintentar CON espera, no microsegundos despues. */
+    bool ok = false;
+    for (int intento = 0; intento < 5 && !ok; intento++) {
+        if (intento) vTaskDelay(pdMS_TO_TICKS(100));
+        if (radio_add(r, SPI_HZ_RAPIDO)) { ok = true; break; }
+        if (r->spi) { spi_bus_remove_device(r->spi); r->spi = NULL; }
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (radio_add(r, SPI_HZ_SEGURO)) { ok = true; g_spi_hz = SPI_HZ_SEGURO; break; }
+        if (r->spi) { spi_bus_remove_device(r->spi); r->spi = NULL; }
     }
-    gpio_set_level(r->ce, 0);
-    park_pins(r);
-}
-
-static void nrf_xfer(nrf_t *r, const uint8_t *tx, uint8_t *rx, size_t len)
-{
-    spi_transaction_t t = {
-        .length = len * 8,
-        .tx_buffer = tx,
-        .rx_buffer = rx,
-    };
-    spi_device_polling_transmit(r->dev, &t);
-}
-
-static uint8_t nrf_cmd(nrf_t *r, uint8_t cmd)
-{
-    uint8_t rx = 0;
-    nrf_xfer(r, &cmd, &rx, 1);
-    return rx;
-}
-
-static void nrf_write_reg(nrf_t *r, uint8_t reg, const uint8_t *data, size_t n)
-{
-    uint8_t tx[33], rx[33];
-    tx[0] = W_REGISTER | (reg & 0x1F);
-    memcpy(&tx[1], data, n);
-    nrf_xfer(r, tx, rx, n + 1);
-}
-
-static void nrf_write_reg8(nrf_t *r, uint8_t reg, uint8_t v)
-{
-    nrf_write_reg(r, reg, &v, 1);
-}
-
-static void nrf_read_reg(nrf_t *r, uint8_t reg, uint8_t *data, size_t n)
-{
-    uint8_t tx[33] = { 0 }, rx[33];
-    tx[0] = R_REGISTER | (reg & 0x1F);
-    nrf_xfer(r, tx, rx, n + 1);
-    memcpy(data, &rx[1], n);
-}
-
-static uint8_t nrf_read_reg8(nrf_t *r, uint8_t reg)
-{
-    uint8_t v;
-    nrf_read_reg(r, reg, &v, 1);
-    return v;
-}
-
-/* ====================== FASE 1: SPI ====================== */
-/* Devuelve errores en REG_ITERS iteraciones. -1 si el bus esta muerto (todo 0x00 o 0xFF). */
-static int reg_stress(nrf_t *r)
-{
-    nrf_cmd(r, NOP);
-    nrf_write_reg8(r, REG_CONFIG, CFG_EN_CRC);
-
-    int errs = 0;
-    int dead = 0;
-    for (int i = 0; i < REG_ITERS; i++) {
-        uint8_t addr[5], back[5];
-        esp_fill_random(addr, 5);
-        nrf_write_reg(r, REG_TX_ADDR, addr, 5);
-        nrf_read_reg(r, REG_TX_ADDR, back, 5);
-        if (memcmp(addr, back, 5) != 0) {
-            errs++;
-            bool all0 = true, allF = true;
-            for (int k = 0; k < 5; k++) {
-                if (back[k] != 0x00) all0 = false;
-                if (back[k] != 0xFF) allF = false;
-            }
-            if (all0 || allF) dead++;
-        }
-
-        uint8_t ch = esp_random() % 126;
-        nrf_write_reg8(r, REG_RF_CH, ch);
-        if (nrf_read_reg8(r, REG_RF_CH) != ch) errs++;
+    if (!ok) {
+        r->spi = NULL;
+        ESP_LOGE(TAG, "%s NO RESPONDE tras 5 intentos (CS=%d CE=%d) - REVISAR HW",
+                 r->nombre, (int)r->cs, (int)r->ce);
+        return false;
     }
-    if (dead >= REG_ITERS - 2) return -1;
-    return errs;
+    nrf_write_reg(r, NRF_STATUS, 0x70);
+    nrf_cmd(r, CMD_FLUSH_TX);
+    ESP_LOGI(TAG, "%s OK [SPI%d CE=%d CS=%d @%dMHz]",
+             r->nombre, (int)r->host, (int)r->ce, (int)r->cs, g_spi_hz / 1000000);
+    return true;
 }
 
-static void phase1_spi(void)
-{
-    ESP_LOGI(TAG, "---- FASE 1: SPI (%d iteraciones) ----", REG_ITERS);
-    for (int i = 0; i < NUM_NRF; i++) {
-        nrf_t *r = &nrf[i];
-        r->best_hz = 0;
-        r->reg_ok = false;
-        for (int s = 0; s < (int)NUM_SPEEDS; s++) {
-            r->errs[s] = -2;
-            if (nrf_open(r, speeds[s]) != ESP_OK) continue;
-            r->errs[s] = reg_stress(r);
-            nrf_close(r);
-            if (r->errs[s] == 0 && r->best_hz == 0) r->best_hz = speeds[s];
-        }
-        r->reg_ok = (r->best_hz != 0);
-
-        char line[160];
-        int n = snprintf(line, sizeof(line), "%s  ", r->name);
-        for (int s = 0; s < (int)NUM_SPEEDS; s++) {
-            const char *res;
-            char buf[16];
-            if (r->errs[s] == -1)      res = "MUERTO";
-            else if (r->errs[s] == -2) res = "n/a";
-            else if (r->errs[s] == 0)  res = "OK";
-            else { snprintf(buf, sizeof(buf), "%d err", r->errs[s]); res = buf; }
-            n += snprintf(line + n, sizeof(line) - n, "%dMHz:%s  ", speeds[s] / 1000000, res);
-        }
-        if (r->best_hz == TEST_SPI_HZ)  ESP_LOGI(TAG, "%s -> pasa a %d MHz", line, TEST_SPI_HZ / 1000000);
-        else if (r->best_hz)            ESP_LOGW(TAG, "%s -> NO pasa a %d MHz, maximo estable %d MHz",
-                                                  line, TEST_SPI_HZ / 1000000, r->best_hz / 1000000);
-        else                            ESP_LOGE(TAG, "%s -> FALLA en todas las velocidades", line);
-    }
+static void jam_enter(radio_t *r) {
+    static const uint8_t dummy[5] = {0,0,0,0,0};
+    ce_lo(r);
+    nrf_cmd(r, CMD_FLUSH_TX);
+    nrf_write_reg(r, NRF_EN_AA, 0x00);
+    nrf_write_reg(r, NRF_EN_RXADDR, 0x00);
+    nrf_write_reg(r, NRF_SETUP_AW, 0x03);
+    nrf_write_reg(r, NRF_SETUP_RETR, 0x00);
+    nrf_write_reg(r, NRF_CONFIG, CONFIG_TX);
+    nrf_write_reg(r, NRF_RF_SETUP, RF_SETUP_MAX);
+    nrf_write_multi(r, NRF_TX_ADDR, dummy, 5);
+    nrf_cmd(r, CMD_FLUSH_TX);
+    vTaskDelay(pdMS_TO_TICKS(3));
+    nrf_write_reg(r, NRF_RF_SETUP, RF_SETUP_CW);
+    bang_arm(r);
+    ce_hi(r);
 }
 
-/* ====================== FASE 2: RF ====================== */
-static const uint8_t RF_ADDR[5] = { 0xE7, 0xE7, 0xE7, 0xE7, 0xE7 };
-
-static void nrf_power_down(nrf_t *r)
-{
-    gpio_set_level(r->ce, 0);
-    nrf_write_reg8(r, REG_CONFIG, CFG_EN_CRC);
-}
-
-static void nrf_common_setup(nrf_t *r)
-{
-    nrf_write_reg8(r, REG_EN_AA, 0x00);
-    nrf_write_reg8(r, REG_EN_RXADDR, 0x01);
-    nrf_write_reg8(r, REG_SETUP_AW, 0x03);
-    nrf_write_reg8(r, REG_SETUP_RETR, 0x00);
-    nrf_write_reg8(r, REG_RF_CH, RF_CHANNEL);
-    nrf_write_reg8(r, REG_RF_SETUP, RF_SETUP_VAL);
-    nrf_write_reg(r, REG_RX_ADDR_P0, RF_ADDR, 5);
-    nrf_write_reg(r, REG_TX_ADDR, RF_ADDR, 5);
-    nrf_write_reg8(r, REG_RX_PW_P0, 4);
-    nrf_cmd(r, FLUSH_TX);
-    nrf_cmd(r, FLUSH_RX);
-    nrf_write_reg8(r, REG_STATUS, ST_RX_DR | ST_TX_DS | ST_MAX_RT);
-}
-
-/* Cuantos paquetes (de RF_PKTS) llegaron bien de tx a rx */
-static int rf_link(nrf_t *tx, nrf_t *rx)
-{
-    int got = 0;
-
-    nrf_common_setup(rx);
-    nrf_write_reg8(rx, REG_CONFIG, CFG_EN_CRC | CFG_PWR_UP | CFG_PRIM_RX);
-    nrf_common_setup(tx);
-    nrf_write_reg8(tx, REG_CONFIG, CFG_EN_CRC | CFG_PWR_UP);
-    vTaskDelay(pdMS_TO_TICKS(5));
-    gpio_set_level(rx->ce, 1);
-    esp_rom_delay_us(150);
-
-    for (int seq = 0; seq < RF_PKTS; seq++) {
-        uint8_t pl[5] = { W_TX_PAYLOAD, (uint8_t)(tx - nrf), (uint8_t)(rx - nrf), (uint8_t)seq, (uint8_t)~seq };
-        uint8_t dummy[5];
-        nrf_xfer(tx, pl, dummy, 5);
-
-        gpio_set_level(tx->ce, 1);
-        esp_rom_delay_us(20);
-        gpio_set_level(tx->ce, 0);
-
-        int t_us = 0;
-        while (t_us < 3000) {
-            uint8_t st = nrf_cmd(tx, NOP);
-            if (st & (ST_TX_DS | ST_MAX_RT)) break;
-            esp_rom_delay_us(50);
-            t_us += 50;
-        }
-        nrf_write_reg8(tx, REG_STATUS, ST_TX_DS | ST_MAX_RT);
-        nrf_cmd(tx, FLUSH_TX);
-
-        esp_rom_delay_us(300);
-
-        uint8_t fifo = nrf_read_reg8(rx, REG_FIFO_STATUS);
-        if (!(fifo & 0x01)) {
-            uint8_t tb[5] = { R_RX_PAYLOAD, 0, 0, 0, 0 }, rb[5];
-            nrf_xfer(rx, tb, rb, 5);
-            if (rb[1] == (uint8_t)(tx - nrf) && rb[2] == (uint8_t)(rx - nrf) &&
-                rb[3] == (uint8_t)seq && rb[4] == (uint8_t)~seq) got++;
-            nrf_write_reg8(rx, REG_STATUS, ST_RX_DR);
-            nrf_cmd(rx, FLUSH_RX);
+static void bang_detectar(radio_t *r) {
+    for (int a = 0; a < 3; a++) {
+        g_bang_align = (uint8_t)a;
+        r->hw = spi_hw(r->host);
+        bang_write(r, CMD_W_REGISTER | NRF_RF_CH, 0x2A);
+        if (nrf_read_reg(r, NRF_RF_CH) == 0x2A) {
+            r->bang_ok = true;
+            ESP_LOGI(TAG, "%s BANG OK align=%d", r->nombre, a);
+            return;
         }
     }
-
-    nrf_power_down(rx);
-    nrf_power_down(tx);
-    return got;
+    r->bang_ok = false;
+    ESP_LOGW(TAG, "%s BANG NO, uso driver", r->nombre);
 }
 
-static void phase2_rf(void)
-{
-    ESP_LOGI(TAG, "---- FASE 2: enlace RF todos contra todos (%d paquetes) ----", RF_PKTS);
-
-    for (int i = 0; i < NUM_NRF; i++) {
-        nrf[i].tx_ok = nrf[i].rx_ok = 0;
-        if (nrf[i].reg_ok) {
-            if (nrf_open(&nrf[i], nrf[i].best_hz) == ESP_OK) nrf_power_down(&nrf[i]);
-            else nrf[i].reg_ok = false;
-        }
+/* ===================== tablas ===================== */
+static void hist_init(void) {
+    s_hist = heap_caps_malloc((size_t)NUM_CANALES * HIST_SCANS, MALLOC_CAP_SPIRAM);
+    if (!s_hist) {
+        ESP_LOGW(TAG, "PSRAM: sin memoria para historia, uso el score simple");
+        return;
     }
-
-    int m[NUM_NRF][NUM_NRF];
-    memset(m, -1, sizeof(m));
-    for (int t = 0; t < NUM_NRF; t++) {
-        for (int rcv = 0; rcv < NUM_NRF; rcv++) {
-            if (t == rcv || !nrf[t].reg_ok || !nrf[rcv].reg_ok) continue;
-            m[t][rcv] = rf_link(&nrf[t], &nrf[rcv]);
-            if (m[t][rcv] > 0) { nrf[t].tx_ok++; nrf[rcv].rx_ok++; }
-        }
-    }
-
-    for (int i = 0; i < NUM_NRF; i++) if (nrf[i].dev) nrf_close(&nrf[i]);
-
-    printf("\n       RX: ");
-    for (int c = 0; c < NUM_NRF; c++) printf("  %s", nrf[c].name);
-    printf("\n");
-    for (int t = 0; t < NUM_NRF; t++) {
-        printf("  TX %s: ", nrf[t].name);
-        for (int c = 0; c < NUM_NRF; c++) {
-            if (m[t][c] < 0) printf("    -- ");
-            else printf("  %2d/%d ", m[t][c], RF_PKTS);
-        }
-        printf("\n");
-    }
-    printf("\n");
+    memset(s_hist, 0, (size_t)NUM_CANALES * HIST_SCANS);
+    ESP_LOGI(TAG, "PSRAM: %d scans x %d canales = %d KB (de 8 MB)",
+             HIST_SCANS, NUM_CANALES,
+             (int)(((size_t)NUM_CANALES * HIST_SCANS) / 1024));
 }
 
-/* ====================== LED WS2812 (RMT) ====================== */
-typedef struct {
-    rmt_encoder_t base;
-    rmt_encoder_t *bytes_encoder;
-    rmt_encoder_t *copy_encoder;
-    int state;
-    rmt_symbol_word_t reset_code;
-} led_enc_t;
-
-static size_t led_enc_encode(rmt_encoder_t *encoder, rmt_channel_handle_t channel,
-                             const void *data, size_t size, rmt_encode_state_t *ret_state)
-{
-    led_enc_t *e = (led_enc_t *)encoder;
-    rmt_encode_state_t session = RMT_ENCODING_RESET;
-    rmt_encode_state_t state = RMT_ENCODING_RESET;
-    size_t encoded = 0;
-
-    switch (e->state) {
-    case 0:
-        encoded += e->bytes_encoder->encode(e->bytes_encoder, channel, data, size, &session);
-        if (session & RMT_ENCODING_COMPLETE) e->state = 1;
-        if (session & RMT_ENCODING_MEM_FULL) { state |= RMT_ENCODING_MEM_FULL; goto out; }
-        /* fallthrough */
-    case 1:
-        encoded += e->copy_encoder->encode(e->copy_encoder, channel, &e->reset_code,
-                                           sizeof(e->reset_code), &session);
-        if (session & RMT_ENCODING_COMPLETE) { e->state = 0; state |= RMT_ENCODING_COMPLETE; }
-        if (session & RMT_ENCODING_MEM_FULL) { state |= RMT_ENCODING_MEM_FULL; goto out; }
-    }
-out:
-    *ret_state = state;
-    return encoded;
+static inline void hist_push(const uint8_t *cuenta) {
+    if (!s_hist) return;
+    for (int c = 0; c < NUM_CANALES; c++)
+        s_hist[(size_t)c * HIST_SCANS + s_hist_idx] = cuenta[c];
+    s_hist_idx = (uint16_t)((s_hist_idx + 1) % HIST_SCANS);
+    if (s_hist_fill < HIST_SCANS) s_hist_fill++;
 }
 
-static esp_err_t led_enc_reset(rmt_encoder_t *encoder)
-{
-    led_enc_t *e = (led_enc_t *)encoder;
-    rmt_encoder_reset(e->bytes_encoder);
-    rmt_encoder_reset(e->copy_encoder);
-    e->state = 0;
-    return ESP_OK;
-}
-
-static esp_err_t led_enc_del(rmt_encoder_t *encoder)
-{
-    led_enc_t *e = (led_enc_t *)encoder;
-    rmt_del_encoder(e->bytes_encoder);
-    rmt_del_encoder(e->copy_encoder);
-    free(e);
-    return ESP_OK;
-}
-
-static rmt_channel_handle_t led_chan;
-static rmt_encoder_handle_t led_encoder;
-
-static void led_init(void)
-{
-    rmt_tx_channel_config_t cc = {
-        .clk_src = RMT_CLK_SRC_DEFAULT,
-        .gpio_num = LED_GPIO,
-        .mem_block_symbols = 64,
-        .resolution_hz = 10000000,
-        .trans_queue_depth = 4,
-    };
-    ESP_ERROR_CHECK(rmt_new_tx_channel(&cc, &led_chan));
-
-    led_enc_t *e = calloc(1, sizeof(led_enc_t));
-    e->base.encode = led_enc_encode;
-    e->base.reset = led_enc_reset;
-    e->base.del = led_enc_del;
-
-    rmt_bytes_encoder_config_t bc = {
-        .bit0 = { .level0 = 1, .duration0 = 3, .level1 = 0, .duration1 = 9 },
-        .bit1 = { .level0 = 1, .duration0 = 9, .level1 = 0, .duration1 = 3 },
-        .flags.msb_first = 1,
-    };
-    ESP_ERROR_CHECK(rmt_new_bytes_encoder(&bc, &e->bytes_encoder));
-    rmt_copy_encoder_config_t cp = {};
-    ESP_ERROR_CHECK(rmt_new_copy_encoder(&cp, &e->copy_encoder));
-    e->reset_code = (rmt_symbol_word_t){ .level0 = 0, .duration0 = 250, .level1 = 0, .duration1 = 250 };
-
-    led_encoder = &e->base;
-    ESP_ERROR_CHECK(rmt_enable(led_chan));
-}
-
-static void led_set(uint8_t r, uint8_t g, uint8_t b)
-{
-    uint8_t grb[3] = { g, r, b };
-    rmt_transmit_config_t tc = { .loop_count = 0 };
-    rmt_transmit(led_chan, led_encoder, grb, sizeof(grb), &tc);
-    rmt_tx_wait_all_done(led_chan, 100);
-}
-
-static void hsv2rgb(uint16_t h, uint8_t s, uint8_t v, uint8_t *r, uint8_t *g, uint8_t *b)
-{
-    h %= 360;
-    uint16_t region = h / 60, rem = (h % 60) * 255 / 60;
-    uint8_t p = (v * (255 - s)) / 255;
-    uint8_t q = (v * (255 - (s * rem) / 255)) / 255;
-    uint8_t t = (v * (255 - (s * (255 - rem)) / 255)) / 255;
-    switch (region) {
-    case 0: *r = v; *g = t; *b = p; break;
-    case 1: *r = q; *g = v; *b = p; break;
-    case 2: *r = p; *g = v; *b = t; break;
-    case 3: *r = p; *g = q; *b = v; break;
-    case 4: *r = t; *g = p; *b = v; break;
-    default: *r = v; *g = p; *b = q; break;
+static inline void hist_stats(int c, int *sat, int *pres, int *total) {
+    *sat = 0; *pres = 0;
+    *total = s_hist_fill ? s_hist_fill : 1;
+    if (!s_hist) return;
+    for (int k = 0; k < s_hist_fill; k++) {
+        int slot = (int)((s_hist_idx + k) % HIST_SCANS);
+        uint8_t h = s_hist[(size_t)c * HIST_SCANS + slot];
+        if (h >= SCAN_MUESTRAS) (*sat)++;
+        else if (h > 0)         (*pres)++;
     }
 }
 
-static void led_rainbow_for(int ms)
-{
-    uint16_t hue = 0;
-    for (int t = 0; t < ms; t += 20) {
-        uint8_t r, g, b;
-        hsv2rgb(hue, 255, 40, &r, &g, &b);
-        led_set(r, g, b);
-        hue += 6;
-        vTaskDelay(pdMS_TO_TICKS(20));
+static void IRAM_ATTR tablas_barrido(tablas_t *t) {
+    int vivos = 0;
+    for (int i = 0; i < NUM_RADIOS; i++) if (radios[i].vivo) vivos++;
+    if (vivos == 0) vivos = 1;
+
+    int por = NUM_CANALES / vivos;
+    int usados = 0;
+    for (int i = 0; i < NUM_RADIOS; i++) {
+        if (!radios[i].vivo) { t->len[i] = 0; continue; }
+        int lo = CH_LO + usados * por;
+        int hi = lo + por - 1;
+        if (usados == vivos - 1) hi = CH_HI;
+        uint8_t n = 0;
+        for (int c = lo; c <= hi && n < MAX_TAB; c++) t->ch[i][n++] = (uint8_t)c;
+        t->len[i] = n;
+        usados++;
     }
+    t->n_total = NUM_CANALES;
+    t->n_rafaga = 0;
+    g_cazando = false;
 }
 
-static void led_blink(uint8_t r, uint8_t g, uint8_t b, int n)
-{
-    for (int i = 0; i < n; i++) {
-        led_set(r, g, b);
-        vTaskDelay(pdMS_TO_TICKS(250));
-        led_set(0, 0, 0);
-        vTaskDelay(pdMS_TO_TICKS(250));
+static inline void insertar(uint8_t *elig, uint16_t *rank, int *ne, int n,
+                            uint8_t ch, uint16_t rk) {
+    int pos = *ne;
+    if (pos >= n) {
+        int min = 0;
+        for (int k = 1; k < *ne; k++) if (rank[k] < rank[min]) min = k;
+        if (rk <= rank[min]) return;
+        pos = min;
+        (*ne)--;
     }
+    while (pos > 0 && rank[pos - 1] < rk) {
+        elig[pos] = elig[pos - 1];
+        rank[pos] = rank[pos - 1];
+        pos--;
+    }
+    elig[pos] = ch;
+    rank[pos] = rk;
+    if (*ne < n) (*ne)++;
 }
 
-/* verdes = radios OK, pausa, rojos = radios con falla, pausa; repite */
-static void led_show_counts(int ok, int bad, int ms)
-{
-    for (int t = 0; t < ms; ) {
-        led_blink(0, 40, 0, ok);
-        vTaskDelay(pdMS_TO_TICKS(400));
-        led_blink(40, 0, 0, bad);
-        vTaskDelay(pdMS_TO_TICKS(900));
-        t += ok * 500 + 400 + bad * 500 + 900;
-    }
-}
+static void IRAM_ATTR tablas_caza(tablas_t *t, int n_max) {
+    uint8_t  elig[MAX_TAB];
+    uint16_t rank[MAX_TAB];
+    int ne = 0, nraf = 0;
 
-/* ====================== MAIN ====================== */
-static void init_spi_buses(void)
-{
-    for (int i = 0; i < NUM_NRF; i++) park_pins(&nrf[i]);
-
-    for (size_t b = 0; b < sizeof(buses) / sizeof(buses[0]); b++) {
-        spi_bus_config_t bc = {
-            .sclk_io_num = buses[b].sck,
-            .mosi_io_num = buses[b].mosi,
-            .miso_io_num = buses[b].miso,
-            .quadwp_io_num = -1,
-            .quadhd_io_num = -1,
-            .max_transfer_sz = 64,
-        };
-        ESP_ERROR_CHECK(spi_bus_initialize(buses[b].host, &bc, SPI_DMA_DISABLED));
-    }
-}
-
-void app_main(void)
-{
-    led_init();
-    led_set(40, 30, 0);
-    init_spi_buses();
-
-    ESP_LOGI(TAG, "Prueba de 6 nRF24L01 | objetivo SPI: %d MHz", TEST_SPI_HZ / 1000000);
-
-    for (int round = 1; ; round++) {
-        ESP_LOGI(TAG, "================ RONDA %d ================", round);
-        led_set(40, 30, 0);
-
-        phase1_spi();
-        phase2_rf();
-
-        int ok = 0;
-        for (int i = 0; i < NUM_NRF; i++) {
-            nrf[i].alive = nrf[i].reg_ok && nrf[i].tx_ok > 0 && nrf[i].rx_ok > 0;
-            if (nrf[i].alive) ok++;
-            if (nrf[i].alive)
-                ESP_LOGI(TAG, "%s: VIVO (SPI max %d MHz, TX a %d radios, RX de %d radios)",
-                         nrf[i].name, nrf[i].best_hz / 1000000, nrf[i].tx_ok, nrf[i].rx_ok);
-            else if (nrf[i].reg_ok)
-                ESP_LOGW(TAG, "%s: SPI OK pero RF falla (TX a %d, RX de %d) -> revisar antena/PA/LNA/cristal/alimentacion",
-                         nrf[i].name, nrf[i].tx_ok, nrf[i].rx_ok);
-            else
-                ESP_LOGE(TAG, "%s: SPI NO responde -> revisar CS/CE/MISO/MOSI/SCK, soldadura y 3.3V", nrf[i].name);
-        }
-
-        if (ok == NUM_NRF) {
-            ESP_LOGI(TAG, "*** LOS 6 NRF VIVOS ***");
-            led_rainbow_for(RESULT_SHOW_MS);
+    for (int c = 0; c < NUM_CANALES; c++) {
+        if (g_cuenta[c] >= SCAN_MUESTRAS) continue;      /* saturado este scan */
+        uint16_t rk;
+        if (s_hist && s_hist_fill >= WARMUP_SCANS) {
+            int sat, pres, total;
+            hist_stats(c, &sat, &pres, &total);
+            if (sat * 100 > total * SAT_FRAC_MAX)   continue;  /* WiFi/fijo */
+            if (pres * 100 < total * PRES_FRAC_MIN) continue;  /* ruido */
+            rk = (uint16_t)(pres * 4 + g_cuenta[c]);
         } else {
-            ESP_LOGE(TAG, "Solo %d de %d radios vivos", ok, NUM_NRF);
-            led_show_counts(ok, NUM_NRF - ok, RESULT_SHOW_MS);
+            uint32_t sc = g_score[c] >> SCORE_SHIFT;
+            if (sc < SCORE_MIN) continue;
+            if (sc >= SAT_MIN) continue;
+            rk = (uint16_t)((g_score[c] >> 4) + g_cuenta[c]);
         }
+        insertar(elig, rank, &ne, n_max, (uint8_t)(CH_LO + c), rk);
     }
+    nraf = ne;
+
+    if (ne == 0 || g_scans < WARMUP_SCANS) { tablas_barrido(t); return; }
+
+    int vivos[NUM_RADIOS], nv = 0;
+    for (int i = 0; i < NUM_RADIOS; i++) {
+        t->len[i] = 0;
+        if (radios[i].vivo) vivos[nv++] = i;
+    }
+    if (nv == 0) { tablas_barrido(t); return; }
+
+    for (int k = 0; k < ne; k++) {
+        int r = vivos[k % nv];
+        if (t->len[r] < MAX_TAB) t->ch[r][t->len[r]++] = elig[k];
+    }
+    for (int k = ne; k < nv; k++) {
+        int r = vivos[k];
+        if (t->len[r] == 0) t->ch[r][t->len[r]++] = elig[k % nraf];
+    }
+
+    t->n_total = (uint8_t)ne;
+    t->n_rafaga = (uint8_t)nraf;
+    g_cazando = true;
+}
+
+static void IRAM_ATTR recalcular(void) {
+    tablas_t *nueva = (g_tab == &g_buf[0]) ? &g_buf[1] : &g_buf[0];
+    int n_max = N_MAX;
+    if (n_max < 1) n_max = 1;
+    if ((uint32_t)n_max > (uint32_t)MAX_TAB) n_max = MAX_TAB;
+
+    tablas_caza(nueva, n_max);
+    __atomic_store_n(&g_tab, nueva, __ATOMIC_RELEASE);
+}
+
+/* ===================== hop ===================== */
+static inline IRAM_ATTR void hop(radio_t *r, int ridx) {
+    if (!r->vivo) return;
+    if (ridx == g_scan_idx) return;
+    const tablas_t *t = __atomic_load_n(&g_tab, __ATOMIC_ACQUIRE);
+    if (t->len[ridx] == 0) return;
+
+    r->idx++;
+    if (r->idx >= t->len[ridx]) { r->idx = 0; r->vueltas++; }
+    uint8_t ch = t->ch[ridx][r->idx];
+    r->canal = ch;
+    if (r->bang_ok) bang_write(r, CMD_W_REGISTER | NRF_RF_CH, ch);
+    else            nrf_write_reg(r, NRF_RF_CH, ch);
+    r->hops++;
+}
+
+/* ===================== scan con VENTANA DE SILENCIO ===================== */
+static radio_t *scan_radio(void) {
+    for (int k = 1; k <= 3; k++) {
+        int i = 3 + ((scan_radio_idx - 3 + k + 3) % 3);
+        if (radios[i].vivo) { scan_radio_idx = i; return &radios[i]; }
+    }
+    return NULL;
+}
+
+static inline void todos_ce_lo(void) {
+    for (int i = 0; i < NUM_RADIOS; i++) if (radios[i].vivo) ce_lo(&radios[i]);
+}
+static inline void todos_ce_hi(void) {
+    for (int i = 0; i < NUM_RADIOS; i++) if (radios[i].vivo) ce_hi(&radios[i]);
+}
+
+static void radio_devolver_tx(radio_t *r) {
+    if (!r || !r->vivo) return;
+    ce_lo(r);
+    nrf_write_reg(r, NRF_CONFIG, CONFIG_TX);
+    nrf_write_reg(r, NRF_RF_SETUP, RF_SETUP_CW);
+    ce_hi(r);
+}
+
+static inline void scan_iniciar(void) {
+    radio_t *r = scan_radio();
+    if (!r) { scan_activo = false; g_scan_idx = -1; return; }
+
+    todos_ce_lo();
+    g_quiet = true;
+
+    g_scan_idx = (int)(r - radios);
+    nrf_write_reg(r, NRF_RF_SETUP, RF_SETUP_MAX);
+    nrf_write_reg(r, NRF_CONFIG, CONFIG_RX);
+    ce_hi(r);
+
+    memset(g_cuenta, 0, sizeof(g_cuenta));
+    scan_pasada = 0;
+    scan_ch = 0;
+    scan_activo = true;
+    scan_t0 = esp_timer_get_time();
+}
+
+static inline void scan_paso(void) {
+    if (g_scan_idx < 0 || g_scan_idx >= NUM_RADIOS) { scan_activo = false; return; }
+    radio_t *r = &radios[g_scan_idx];
+    if (!r->vivo) { scan_activo = false; g_scan_idx = -1; return; }
+    nrf_write_reg(r, NRF_RF_CH, (uint8_t)(CH_LO + scan_ch));
+    esp_rom_delay_us(200);              /* 130us sintetizador + 40us AGC */
+    if (nrf_read_reg(r, NRF_RPD) & 0x01) g_cuenta[scan_ch]++;
+
+    scan_ch++;
+    if (scan_ch >= NUM_CANALES) { scan_ch = 0; scan_pasada++; }
+}
+
+static inline void score_actualizar(void) {
+    for (int c = 0; c < NUM_CANALES; c++) {
+        if (g_cuenta[c] >= SCAN_MUESTRAS) { g_score[c] = 0; continue; }
+        uint32_t s = (uint32_t)g_score[c] + (uint32_t)g_cuenta[c] * SCORE_ONE;
+        s -= s / SCORE_DEC;
+        if (s > 0xFFFFu) s = 0xFFFFu;
+        g_score[c] = (uint16_t)s;
+    }
+}
+
+static inline void scan_fin(void) {
+    if (g_scan_idx >= 0 && g_scan_idx < NUM_RADIOS)
+        radio_devolver_tx(&radios[g_scan_idx]);
+
+    score_actualizar();
+    hist_push(g_cuenta);
+    if (g_scans < 255) g_scans++;
+    g_scan_idx = -1;
+
+    todos_ce_hi();
+    g_quiet = false;
+    g_ventana_us = (uint32_t)(esp_timer_get_time() - scan_t0);
+
+    scan_activo = false;
+    recalcular();
+    g_flash = true;
+}
+
+/* ===================== LED ===================== */
+static void led_set(uint8_t rr, uint8_t gg, uint8_t bb) {
+    led_strip_set_pixel(led, 0, rr, gg, bb);
+    led_strip_refresh(led);
+}
+static void led_init(void) {
+    led_strip_config_t sc = { .strip_gpio_num = LED_GPIO, .max_leds = 1,
+        .led_model = LED_MODEL_WS2812,
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB };
+    led_strip_rmt_config_t rc = { .clk_src = RMT_CLK_SRC_DEFAULT, .resolution_hz = 10 * 1000 * 1000 };
+    ESP_ERROR_CHECK(led_strip_new_rmt_device(&sc, &rc, &led));
+    led_set(60, 0, 0); vTaskDelay(pdMS_TO_TICKS(120));
+    led_set(0, 60, 0); vTaskDelay(pdMS_TO_TICKS(120));
+    led_set(0, 0, 60); vTaskDelay(pdMS_TO_TICKS(120));
+    led_set(0, 0, 0);
+}
+static void led_update(void) {
+    if (g_vivos == 0) { led_set(LED_BRILLO, 0, 0); return; }
+    if (g_flash)   { g_flash = false; led_set(LED_BRILLO, LED_BRILLO, LED_BRILLO); return; }
+    int64_t t = esp_timer_get_time();
+    if (g_cazando) {
+        int fase = (int)((t % 1500000) * 2 / 1500000);
+        led_set(0, LED_BRILLO, (uint8_t)(LED_BRILLO / 3 * fase));
+        return;
+    }
+    if (g_vivos < NUM_RADIOS) {
+        int fase = (int)((t % 3000000) * 2 / 3000000);
+        led_set((uint8_t)(LED_BRILLO * fase / 2), (uint8_t)(LED_BRILLO * fase / 3), 0);
+        return;
+    }
+    led_set(0, 0, LED_BRILLO);
+}
+
+/* ===================== tasks ===================== */
+static void IRAM_ATTR jam_bus2(void *arg) {
+    int64_t t_cede = esp_timer_get_time();
+    for (;;) {
+        uint32_t c0 = cyc();
+        hop(&radios[0], 0);
+        hop(&radios[1], 1);
+        hop(&radios[2], 2);
+        uint32_t d = g_dwell * CPU_MHZ;
+        while (cyc() - c0 < d) { }
+        int64_t now = esp_timer_get_time();
+        if (now - t_cede >= (int64_t)CEDE_MS * 1000) { t_cede = now; vTaskDelay(1); }
+    }
+}
+
+static void IRAM_ATTR jam_bus3(void *arg) {
+    int64_t t_cede = esp_timer_get_time(), t_scan = esp_timer_get_time(), t_led = t_cede;
+    for (;;) {
+        uint32_t c0 = cyc();
+        hop(&radios[3], 3);
+        hop(&radios[4], 4);
+        hop(&radios[5], 5);
+
+        int64_t now = esp_timer_get_time();
+
+        if (!scan_activo && !g_quiet && now - t_scan >= (int64_t)REESCANEO_MS * 1000) {
+            t_scan = now;
+            scan_iniciar();
+        }
+
+        if (scan_activo) {
+            scan_paso();
+            if (scan_pasada >= SCAN_MUESTRAS ||
+                (scan_ch == 0 && (now - scan_t0) >= (int64_t)SCAN_HARD_MS * 1000)) {
+                scan_fin();
+            }
+        }
+
+        uint32_t d = g_dwell * CPU_MHZ;
+        while (cyc() - c0 < d) { }
+
+        now = esp_timer_get_time();
+        if (now - t_led >= 64000) { t_led = now; led_update(); }
+        if (now - t_cede >= (int64_t)CEDE_MS * 1000) { t_cede = now; vTaskDelay(1); }
+    }
+}
+
+/* ===================== monitor ===================== */
+static void mapa_linea(char *out, int n) {
+    int i = 0;
+    for (int c = 0; c < NUM_CANALES && i < n - 1; c++) {
+        uint32_t s = g_score[c] >> SCORE_SHIFT;
+        out[i++] = (s == 0) ? '.' : (s < SCORE_MIN) ? 'o'
+                 : (s < SAT_MIN)   ? 'O' : (s < 64) ? '#' : '@';
+    }
+    out[i] = 0;
+}
+
+static void monitor_task(void *arg) {
+    uint32_t prev[NUM_RADIOS];
+    int64_t  tprev[NUM_RADIOS];
+    for (int i = 0; i < NUM_RADIOS; i++) { prev[i] = 0; tprev[i] = esp_timer_get_time(); }
+    char mapa[NUM_CANALES + 1];
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        int64_t now = esp_timer_get_time();
+        const tablas_t *t = __atomic_load_n(&g_tab, __ATOMIC_ACQUIRE);
+
+        int vivos = 0, len_max = 0;
+        uint32_t us = 0xFFFFFFFFu;
+        for (int i = 0; i < NUM_RADIOS; i++) {
+            radio_t *r = &radios[i];
+            if (!r->vivo) continue;
+            vivos++;
+            if (t->len[i] > len_max) len_max = t->len[i];
+            uint32_t dh = r->hops - prev[i];
+            int64_t  dt = now - tprev[i];
+            prev[i] = r->hops; tprev[i] = now;
+            if (dh && dt > 0) {
+                uint32_t u = (uint32_t)(dt / dh);
+                if (u < us) us = u;
+            }
+        }
+        if (vivos == 0 || len_max == 0) continue;
+        if (us == 0xFFFFFFFFu) us = 0;
+
+        uint32_t gap       = (uint32_t)(len_max - 1) * g_dwell;
+        uint32_t ocup      = 100u / (uint32_t)len_max;
+        uint32_t est       = (g_dwell > 130u) ? ((g_dwell - 130u) * 100u / g_dwell) : 0;
+        uint32_t estable   = ocup * est / 100u;
+        uint32_t cobertura = (t->n_total > 0) ? ((uint32_t)vivos * 100u / t->n_total) : 0;
+        uint32_t perdida   = (g_ventana_us > 0) ? (g_ventana_us * 100u / ((uint32_t)REESCANEO_MS * 1000u)) : 0;
+
+        ESP_LOGI(TAG, "%s | obj=%d (rafaga=%d) | L=%d | GAP=%luus | scans=%d | ventana=%luus (-%lu%%)",
+                 g_cazando ? "CAZA" : "BARRIDO", t->n_total, t->n_rafaga,
+                 len_max, (unsigned long)gap, g_scans,
+                 (unsigned long)g_ventana_us, (unsigned long)(perdida > 100 ? 100 : perdida));
+        ESP_LOGI(TAG, "  ocup/canal=%lu%%  PLL_est=%lu%%  =>  ESTABLE=%lu%%  cobertura=%lu%%",
+                 (unsigned long)ocup, (unsigned long)est, (unsigned long)estable,
+                 (unsigned long)cobertura);
+        ESP_LOGI(TAG, "  DH3(%uus):%s  DH5(%uus):%s  dwell=%lu SPI=%dMHz vivos=%d",
+                 (unsigned)PAQUETE_DH3, (gap < PAQUETE_DH3) ? "OK" : "NO",
+                 (unsigned)PAQUETE_DH5, (gap < PAQUETE_DH5) ? "OK" : "NO",
+                 (unsigned long)g_dwell, g_spi_hz / 1000000, vivos);
+
+        mapa_linea(mapa, sizeof(mapa));
+        ESP_LOGI(TAG, "  MAPA[2..80] .=0 o<%d O<SAT #<64 @=denso:", SCORE_MIN);
+        ESP_LOGI(TAG, "  %s", mapa);
+    }
+}
+
+/* ===================== piso de ruido propio ===================== */
+static void test_piso_ruido(void) {
+    radio_t *r = NULL;
+    for (int i = 5; i >= 3; i--) if (radios[i].vivo) { r = &radios[i]; break; }
+    if (!r) { ESP_LOGW(TAG, "PISO: sin radio disponible"); return; }
+
+    const uint8_t CH = 40;
+    const uint8_t probes[3] = { CH, CH + 2, CH + 20 };
+
+    for (int i = 0; i < NUM_RADIOS; i++) {
+        if (!radios[i].vivo || &radios[i] == r) continue;
+        nrf_write_reg(&radios[i], NRF_RF_CH, CH);
+    }
+
+    int cocal[3] = {0,0,0}, lejos[3] = {0,0,0};
+
+    for (int p = 0; p < 3; p++) {
+        ce_lo(r);
+        nrf_write_reg(r, NRF_RF_SETUP, RF_SETUP_MAX);
+        nrf_write_reg(r, NRF_CONFIG, CONFIG_RX);
+        ce_hi(r);
+        nrf_write_reg(r, NRF_RF_CH, probes[p]);
+        esp_rom_delay_us(200);
+        if (nrf_read_reg(r, NRF_RPD) & 0x01) cocal[p] = 1;
+    }
+
+    todos_ce_lo();
+    for (int p = 0; p < 3; p++) {
+        ce_lo(r);
+        nrf_write_reg(r, NRF_RF_SETUP, RF_SETUP_MAX);
+        nrf_write_reg(r, NRF_CONFIG, CONFIG_RX);
+        ce_hi(r);
+        nrf_write_reg(r, NRF_RF_CH, probes[p]);
+        esp_rom_delay_us(200);
+        if (nrf_read_reg(r, NRF_RPD) & 0x01) lejos[p] = 1;
+    }
+
+    radio_devolver_tx(r);
+    todos_ce_hi();
+
+    ESP_LOGI(TAG, "PISO (ch%d): co-canal TX=%d sil=%d | +2 TX=%d sil=%d | +20 TX=%d sil=%d",
+             CH, cocal[0], lejos[0], cocal[1], lejos[1], cocal[2], lejos[2]);
+    if (cocal[0] && !lejos[0])
+        ESP_LOGW(TAG, "  Te oyes a ti mismo: la ventana de silencio es OBLIGATORIA.");
+    else if (cocal[0])
+        ESP_LOGW(TAG, "  Hay otra fuente de RF en el canal %d.", CH);
+    else
+        ESP_LOGI(TAG, "  Buen aislamiento en el mismo canal.");
+}
+
+/* ===================== arranque ===================== */
+void app_main(void) {
+    led_init();
+
+    /* FIX v8.1: PRIMERO estacionar los 6 pares CS/CE, DESPUES los buses SPI.
+     * Si se inicializa un bus con los CS de los demas flotando, cualquier
+     * escritura colisiona en MISO y el readback falla. */
+    park_all_pins();
+
+    bus_init(SPI2_HOST, GPIO_NUM_12, GPIO_NUM_11, GPIO_NUM_13);
+    bus_init(SPI3_HOST, GPIO_NUM_18, GPIO_NUM_8,  GPIO_NUM_7);
+
+    int activos = 0;
+    for (int i = 0; i < NUM_RADIOS; i++) radios[i].vivo = radio_init(&radios[i]);
+    for (int i = 0; i < NUM_RADIOS; i++) if (radios[i].vivo) activos++;
+
+    if (activos == 0) {
+        ESP_LOGE(TAG, "NINGUN NRF. Revisa alimentacion.");
+        for (;;) { led_set(60, 0, 0); vTaskDelay(pdMS_TO_TICKS(200)); }
+    }
+
+    for (int i = 0; i < NUM_RADIOS; i++) {
+        if (!radios[i].vivo) continue;
+        jam_enter(&radios[i]);
+        bang_detectar(&radios[i]);
+        radios[i].bang_sucio = true;
+    }
+
+    tablas_barrido(&g_buf[0]);
+    tablas_barrido(&g_buf[1]);
+    __atomic_store_n(&g_tab, &g_buf[0], __ATOMIC_RELEASE);
+
+    g_jam_ok = (activos > 0);
+    g_vivos = activos;
+
+    hist_init();
+    test_piso_ruido();
+
+    xTaskCreatePinnedToCore(jam_bus2, "bus2", 4096, NULL, configMAX_PRIORITIES - 1, NULL, 1);
+    xTaskCreatePinnedToCore(jam_bus3, "bus3", 4096, NULL, configMAX_PRIORITIES - 1, NULL, 0);
+    xTaskCreatePinnedToCore(monitor_task, "mon", 3072, NULL, 1, NULL, 0);
+
+    ESP_LOGI(TAG, "CAZADOR v8.1 · %d/6 radios · dwell=%uus · N_max=%d · SPI=%dMHz",
+             activos, (unsigned)DWELL_US, N_MAX, g_spi_hz / 1000000);
+    ESP_LOGI(TAG, "Arranca en BARRIDO. La caza tarda ~20-25 s en converger.");
+    ESP_LOGI(TAG, "BT~%.1f · ruido~%.1f · WiFi~%.1f | SCORE_MIN=%d SAT_MIN=%d",
+             (double)SCORE_DEC * SCAN_MUESTRAS * 0.05,
+             (double)SCORE_DEC * SCAN_MUESTRAS * 0.01,
+             (double)SCORE_DEC * SCAN_MUESTRAS * 0.85,
+             SCORE_MIN, SAT_MIN);
+    ESP_LOGI(TAG, "Verde = cazando · Azul = barrido · Blanco = recalculo");
+    vTaskDelay(portMAX_DELAY);
 }
