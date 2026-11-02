@@ -1,50 +1,51 @@
 /*
- * main.c — CAZADOR v9.1 — 6x nRF24L01+ PA/LNA — ESP32-S3 N16R8 — ESP-IDF v6.0.3
+ * main.c — CAZADOR v8.2 — 6x nRF24L01+ PA/LNA — ESP32-S3 N16R8 — ESP-IDF v6.0.3
  *
  * SPI2 (SCK 12, MOSI 11, MISO 13): NRF1(CE 4 CS 10) NRF2(CE 5 CS 9)  NRF3(CE 6 CS 14)
  * SPI3 (SCK 18, MOSI 8,  MISO 7):  NRF4(CE 1 CS 21) NRF5(CE 15 CS 16) NRF6(CE 17 CS 38)
  * WS2812 en GPIO 48.
  *
- * ====== v9.1 SOBRE v9: BARRIDO BARAJADO + JITTER ======
- * 1) ESCALON_MS 4000 -> 6000.
- * 2) tablas_barrido ya NO reparte bloques contiguos. Hace una permutacion
- *    Fisher-Yates de los 79 canales y la reparte round-robin entre los radios
- *    vivos. Rompe el "peine rigido" de 6 canales contiguos que se desplazaba
- *    en lockstep: cada radio ve canales esparcidos por TODA la banda, en orden
- *    impredecible, y dos radios nunca coinciden en el mismo indice.
- * 3) Jitter de dwell en los dos buses (+0..50%). Rompe la periodicidad y
- *    decorrelaciona los dos buses que antes caminaban en fase.
+ * ====== FIX v8.2: DWELL_MIN_US ERA UN VLA ======
+ * La v9.1 definia  #define DWELL_MIN_US k_dwell[0]  y de ahi salian L_MAX,
+ * N_MAX y MAX_TAB. En C, k_dwell[0] NO es una expresion constante: es un
+ * elemento de array. Las macros dejaban de ser constantes y
+ *     uint8_t ch[NUM_RADIOS][MAX_TAB];
+ * se volvia un VLA a nivel de archivo -> ilegal. GCC lo reportaba como
+ * "variably modified 'ch' at file scope" en la linea del struct, 30 lineas
+ * despues de la causa real.
+ * Ahora DWELL_MIN_US es una constante literal y un _Static_assert lo ata a
+ * k_dwell[0] para que no se desincronicen.
  *
- * ====== POR QUE EL BARRIDO COMPLETO YA ES ANTI-AFH ======
- * AFH re-clasifica cada ~1 s (afh_scan_interval, Silabs). Un ciclo completo
- * de 79 canales a 320us son 4.5 ms: 200x mas rapido que la ventana de AFH.
- * La piconet ve TODOS los canales como malos, no puede hacer nada. Eso es
- * lo que la caza (v10) perdia: fijaba 20 canales, AFH los excluia y se iba
- * a los otros 59. Con 6 radios no se gana por potencia: se ataca todo.
+ * ====== QUE MANTIENE DE v8.1 (QUE YA FUNCIONO) ======
+ * - park_all_pins() ANTES de cualquier transaccion SPI: con un CS flotando en
+ *   bajo, su nRF drivea MISO y colisiona el bus -> falso "NO RESPONDE".
+ *   Con este fix los 6 radios subieron.
+ * - radio_init() con 5 reintentos y esperas de 100ms + LIBERACION del device
+ *   en cada fallo (el IDF v6.0.3 reserva un slot de CS por dispositivo y hay
+ *   3 por bus).
+ * - VENTANA DE SILENCIO: el escaner esta a centimetros de 5 TX de +18 dBm.
+ *   Sin bajar los CE, el mapa sale todo saturado -> BARRIDO para siempre.
+ * - Score en punto fijo 1/256: con division entera y DEC=24, cualquier score
+ *   entre 1 y 23 NUNCA decae. En 1/256 el decremento existe siempre.
+ * - Doble buffer de tablas + atomic store: el monitor lee mientras los
+ *   nucleos recalculan.
  *
- * Lo que SI queda expuesto con barrido puro es la PREDICTIBILIDAD: con 6
- * bloques contiguos en lockstep se puede caracterizar el patron en un ciclo.
- * De ahi el barajado y el jitter.
- *
- * ====== v9 QUE SIGUE VALIENDO ======
- * - park_all_pins() ANTES de cualquier transaccion SPI (v8.1): con CS
- *   flotando en bajo, su nRF drivea MISO y colisiona el bus -> falso
- *   "NO RESPONDE".
- * - radio_init() con 5 reintentos y esperas de 100ms: el power-on reset del
- *   nRF24L01+ no es confiable en los primeros milisegundos.
- * - radio_init() LIBERA el device en cada fallo: el IDF v6.0.3 reserva un
- *   slot de CS por dispositivo y hay 3 por bus. Sin liberar, 2 fallos matan
- *   el bus.
- * - VENTANA DE SILENCIO (Ventana_SCAN=1): el escaner esta a centimetros de
- *   5 TX de +18 dBm. Sin silencio el mapa sale todo saturado.
- * - Score en punto fijo 1/256: con division entera y DEC=24, cualquier
- *   score entre 1 y 23 no decae nunca. Guardado en 1/256 el decremento
- *   existe para cualquier valor.
+ * ====== POR QUE DWELL FIJO 320 (no escalera) ======
+ * El PLL del nRF24 tarda ~130us en enganchar. Por debajo, la portadora BARRE
+ * (chirp) y la potencia se dispersa. Lo que importa es el tiempo de portadora
+ * ESTABLE dentro de un paquete:
+ *     slots_estables = (T/dwell) * (dwell-130)/dwell
+ *   dwell=170 -> 24% estable  ->  2.24 slots en un DH3
+ *   dwell=320 -> 59% estable  ->  3.01 slots en un DH3
+ *   dwell=260 -> 50% estable  ->  3.12 slots en un DH3  (optimo teorico)
+ * 320us queda por encima del optimo por el margen de seguridad del GAP:
+ * con L=4 y d=320 el gap es 960us, que cubre el DH3 (1622us) con 662us.
+ * La escalera 180->320 te hace perder el DH3:OK durante 24 de cada 30 segundos.
  *
  * ====== GEOMETRIA ======
- * gap = (L-1)*d. Un paquete de duracion T cae en una ventana garantizada
- * si T > gap. En barrido L=14 (79/6): gap 2340us a 180us (cubre DH5),
- * 4160us a 320us (no cubre DH5 pero el ciclo completo sigue siendo 4.5ms).
+ * gap = (L-1)*d, NO la revisita. Un paquete de duracion T cae en una ventana
+ * de golpeo garantizada si T > gap. d=320 y GAP_MAX=1200 -> L=4, 24 canales,
+ * gap 960us: cubre DH3 (1622) con 662us de margen.
  */
 
 #include <stdio.h>
@@ -69,38 +70,25 @@ static const char *TAG = "CAZA";
 #define NUM_CANALES  (CH_HI - CH_LO + 1)      /* 79 */
 #define NUM_RADIOS   6
 
-/* ---- ESCALERA DE DWELL ----
- * 6 s por escalon. 130us es el umbral del PLL: por debajo la portadora
- * BARRE (chirp), por encima queda CW plena. */
-#define ESCALON_MS    6000u      /* 6 s por escalon */
-#define DWELL_LOOP    0          /* 1 = al llegar arriba vuelve a empezar */
-static const uint16_t k_dwell[] = { 180u, 220u, 260u, 300u, 320u };
-#define N_ESCALONES   ((int)(sizeof(k_dwell) / sizeof(k_dwell[0])))
+#define DWELL_US     320u        /* > 130us: PLL engancha, potencia plena */
 
-#define DWELL_MIN_US  k_dwell[0]
-#define DWELL_US      DWELL_MIN_US
+#define PAQUETE_DH3  1622u       /* duracion real de paquete DH3 */
+#define PAQUETE_DH5  2870u       /* duracion real de paquete DH5 (BR) */
 
-/* ---- MODO ---- */
-#define FORZAR_BARRIDO  1        /* 1 = nunca caza: los 6 barren los 79 siempre */
-#define VENTANA_SCAN    1        /* 1 = ventana de silencio + MAPA (cuesta 5%) */
+#define SCAN_MUESTRAS  3         /* pasadas completas por ventana */
+#define REESCANEO_MS   1200      /* cada cuanto se escanea */
+#define SCAN_HARD_MS   900       /* techo duro; solo corta en frontera de pasada */
 
-#define PAQUETE_DH3  1622u
-#define PAQUETE_DH5  2870u
-
-#define SCAN_MUESTRAS  3
-#define REESCANEO_MS   1200
-#define SCAN_HARD_MS   900
-
-/* Score en 1/256 de unidad (punto fijo). */
+/* Score en 1/256 de unidad (punto fijo). Ver cabecera. */
 #define SCORE_SHIFT   8
 #define SCORE_ONE     (1u << SCORE_SHIFT)
 
 /* BT~3.6 · ruido~0.72 · WiFi~61 */
 #define SCORE_DEC      24
-#define SCORE_MIN      2
-#define SAT_MIN       12
+#define SCORE_MIN      2         /* entre ruido y BT */
+#define SAT_MIN       12         /* entre BT y WiFi */
 
-#define WARMUP_SCANS   12
+#define WARMUP_SCANS   12        /* el fallback ne==0 cubre el resto */
 
 #define SPI_HZ_RAPIDO (16 * 1000 * 1000)
 #define SPI_HZ_SEGURO (10 * 1000 * 1000)
@@ -108,8 +96,9 @@ static const uint16_t k_dwell[] = { 180u, 220u, 260u, 300u, 320u };
 #define CPU_MHZ      240u
 #define CEDE_MS      2000
 
+/* gap = (L-1)*d < GAP_MAX. 1200 deja 422us de margen sobre el DH3. */
 #define GAP_MAX_US   1200u
-#define L_MAX  ((GAP_MAX_US / DWELL_MIN_US) + 1u)
+#define L_MAX  ((GAP_MAX_US / DWELL_US) + 1u)
 #define N_MAX  ((NUM_RADIOS * L_MAX) < NUM_CANALES ? (NUM_RADIOS * L_MAX) : NUM_CANALES)
 #define MAX_TAB (N_MAX + 2)
 
@@ -127,8 +116,6 @@ static volatile int  g_vivos = 0;
 static volatile bool g_flash  = false;
 static volatile bool g_cazando = false;
 static volatile bool g_quiet  = false;
-static volatile int64_t g_pulso_hasta = 0;
-static volatile uint8_t g_escalon = 0;
 
 /* ===================== nRF24 ===================== */
 #define NRF_CONFIG     0x00
@@ -148,12 +135,6 @@ static volatile uint8_t g_escalon = 0;
 
 #define RF_CONT_WAVE (1u << 7)
 #define RF_PLL_LOCK  (1u << 4)
-
-/* RF_SETUP 0x0E = 0b00001110:
- *   bit3 RF_DR_HIGH=1, bit5 RF_DR_LOW=0 -> 2 Mbps
- *   bits2:1 RF_PWR=11                   -> 0 dBm (maximo)
- * En CW no viaja dato, pero la desviacion del modulador y el nivel del PA
- * quedan fijados por estos bits. 0x0E es el techo de la parte. */
 #define RF_SETUP_MAX 0x0E
 #define RF_SETUP_CW  (RF_SETUP_MAX | RF_CONT_WAVE | RF_PLL_LOCK)
 #define CONFIG_TX    0x0E
@@ -172,10 +153,11 @@ static tablas_t *g_tab = &g_buf[0];
 
 /* ===================== estado del scan ===================== */
 static uint8_t  g_cuenta[NUM_CANALES];
-static uint16_t g_score[NUM_CANALES];
-#define HIST_SCANS   256
-#define SAT_FRAC_MAX 30
-#define PRES_FRAC_MIN 8
+static uint16_t g_score[NUM_CANALES];     /* 1/256 de unidad */
+/* Historia de escaneos en PSRAM (8 MB disponibles). */
+#define HIST_SCANS   256                  /* ~5 min a 1.2 s por scan */
+#define SAT_FRAC_MAX 30                   /* >30% saturado = WiFi */
+#define PRES_FRAC_MIN 8                   /* <8% con rafaga = ruido */
 static uint8_t  *s_hist = NULL;
 static uint16_t  s_hist_idx = 0;
 static uint16_t  s_hist_fill = 0;
@@ -188,7 +170,7 @@ static int64_t  scan_t0 = 0;
 static int      scan_radio_idx = 5;
 static volatile int g_scan_idx = -1;
 static volatile uint32_t g_ventana_us = 0;
-static volatile uint8_t  g_sel = 0;
+static volatile uint8_t  g_sel = 0;   /* 0=barrido 1=hist 2=score */
 
 /* ===================== radios ===================== */
 typedef struct {
@@ -226,15 +208,6 @@ static volatile uint32_t g_dwell = DWELL_US;
 static uint8_t           g_bang_align = 0;
 static int               g_spi_hz = SPI_HZ_RAPIDO;
 
-/* ---- RNG: xorshift32 en IRAM. Semilla fija, periodo 2^32-1, sin div. ---- */
-static volatile uint32_t g_rng = 0x9E3779B9u;
-static inline IRAM_ATTR uint32_t rnd(void) {
-    uint32_t r = g_rng;
-    r ^= r << 13; r ^= r >> 17; r ^= r << 5;
-    g_rng = r;
-    return r;
-}
-
 /* GPIO 0..31 -> OUT_W1TS/W1TC ; GPIO 32..46 -> OUT1_* */
 #define GPIO_OUT_W1TS  (*(volatile uint32_t *)0x60004008u)
 #define GPIO_OUT_W1TC  (*(volatile uint32_t *)0x6000400Cu)
@@ -247,15 +220,15 @@ static inline void ce_hi(radio_t *r) {
 }
 static inline void ce_lo(radio_t *r) {
     if ((uint32_t)r->ce >= 32) GPIO_OUT1_W1TC = 1u << ((uint32_t)r->ce - 32);
-    else                       GPIO_OUT_W1TC = 1u << (uint32_t)r->ce;
+    else                       GPIO_OUT_W1TC  = 1u << (uint32_t)r->ce;
 }
 static inline void cs_lo(radio_t *r) {
     if (r->cs_alto) GPIO_OUT1_W1TC = 1u << ((uint32_t)r->cs - 32);
-    else            GPIO_OUT_W1TC = 1u << (uint32_t)r->cs;
+    else            GPIO_OUT_W1TC  = 1u << (uint32_t)r->cs;
 }
 static inline void cs_hi(radio_t *r) {
     if (r->cs_alto) GPIO_OUT1_W1TS = 1u << ((uint32_t)r->cs - 32);
-    else            GPIO_OUT_W1TS = 1u << (uint32_t)r->cs;
+    else            GPIO_OUT_W1TS  = 1u << (uint32_t)r->cs;
 }
 
 /* ===================== SPI directo (bang) ===================== */
@@ -274,6 +247,8 @@ static void IRAM_ATTR bang_arm(radio_t *r) {
     hw->ms_dlen.ms_data_bitlen = 15;
 }
 
+/* El driver reescribe user/ms_dlen/dma_conf en cada transaccion. Cualquier
+ * transaccion por driver marca a TODOS los radios de ese bus. */
 static void marcar_sucio(spi_host_device_t h) {
     for (int i = 0; i < NUM_RADIOS; i++)
         if (radios[i].vivo && radios[i].host == h) radios[i].bang_sucio = true;
@@ -327,6 +302,8 @@ static void bus_init(spi_host_device_t host, gpio_num_t sck, gpio_num_t mosi, gp
     ESP_ERROR_CHECK(spi_bus_initialize(host, &buscfg, SPI_DMA_DISABLED));
 }
 
+/* FIX v8.1: park de LOS SEIS radios antes de que exista cualquier transaccion
+ * SPI. gpio_reset_pin limpia el mux/pull que dejo el bootloader. */
 static void park_all_pins(void) {
     for (int i = 0; i < NUM_RADIOS; i++) {
         radio_t *r = &radios[i];
@@ -334,11 +311,11 @@ static void park_all_pins(void) {
 
         gpio_reset_pin(r->ce);
         gpio_set_direction(r->ce, GPIO_MODE_OUTPUT);
-        gpio_set_level(r->ce, 0);
+        gpio_set_level(r->ce, 0);          /* CE bajo: nadie emite */
 
         gpio_reset_pin(r->cs);
         gpio_set_direction(r->cs, GPIO_MODE_OUTPUT);
-        gpio_set_level(r->cs, 1);
+        gpio_set_level(r->cs, 1);          /* CS alto: nadie ensucia MISO */
 
         r->hw = spi_hw(r->host);
     }
@@ -355,10 +332,13 @@ static bool radio_add(radio_t *r, int hz) {
 }
 
 static bool radio_init(radio_t *r) {
+    /* Los pines ya estan estacionados por park_all_pins(). Solo fijar estado. */
     ce_lo(r);
     cs_hi(r);
     r->hw = spi_hw(r->host);
 
+    /* nRF24L01+ power-on reset: el mapa de registros no es confiable durante
+     * el arranque. Reintentar CON espera, no microsegundos despues. */
     bool ok = false;
     for (int intento = 0; intento < 5 && !ok; intento++) {
         if (intento) vTaskDelay(pdMS_TO_TICKS(100));
@@ -422,7 +402,7 @@ static void hist_init(void) {
         return;
     }
     memset(s_hist, 0, (size_t)NUM_CANALES * HIST_SCANS);
-    ESP_LOGI(TAG, "PSRAM: %d scans x %d canales = %d KB",
+    ESP_LOGI(TAG, "PSRAM: %d scans x %d canales = %d KB (de 8 MB)",
              HIST_SCANS, NUM_CANALES,
              (int)(((size_t)NUM_CANALES * HIST_SCANS) / 1024));
 }
@@ -447,29 +427,23 @@ static inline void hist_stats(int c, int *sat, int *pres, int *total) {
     }
 }
 
-/* v9.1: permutacion Fisher-Yates + reparto round-robin. Rompe el peine
- * rigido de bloques contiguos. Dos radios NUNCA coinciden en el mismo indice
- * (el reparto es k % nv), asi que siempre estan en canales distintos. */
 static void IRAM_ATTR tablas_barrido(tablas_t *t) {
-    static uint8_t perm[NUM_CANALES];
-    for (int i = 0; i < NUM_CANALES; i++) perm[i] = (uint8_t)(CH_LO + i);
-    for (int i = NUM_CANALES - 1; i > 0; i--) {
-        int j = (int)(rnd() % (uint32_t)(i + 1));
-        uint8_t tmp = perm[i]; perm[i] = perm[j]; perm[j] = tmp;
-    }
+    int vivos = 0;
+    for (int i = 0; i < NUM_RADIOS; i++) if (radios[i].vivo) vivos++;
+    if (vivos == 0) vivos = 1;
 
-    int vivos[NUM_RADIOS], nv = 0;
+    int por = NUM_CANALES / vivos;
+    int usados = 0;
     for (int i = 0; i < NUM_RADIOS; i++) {
-        t->len[i] = 0;
-        if (radios[i].vivo) vivos[nv++] = i;
+        if (!radios[i].vivo) { t->len[i] = 0; continue; }
+        int lo = CH_LO + usados * por;
+        int hi = lo + por - 1;
+        if (usados == vivos - 1) hi = CH_HI;
+        uint8_t n = 0;
+        for (int c = lo; c <= hi && n < MAX_TAB; c++) t->ch[i][n++] = (uint8_t)c;
+        t->len[i] = n;
+        usados++;
     }
-    if (nv == 0) return;
-
-    for (int k = 0; k < NUM_CANALES; k++) {
-        int r = vivos[k % nv];
-        if (t->len[r] < MAX_TAB) t->ch[r][t->len[r]++] = perm[k];
-    }
-
     t->n_total = NUM_CANALES;
     t->n_rafaga = 0;
     g_cazando = false;
@@ -501,21 +475,21 @@ static void IRAM_ATTR tablas_caza(tablas_t *t, int n_max) {
     uint16_t rank[MAX_TAB];
     int ne = 0, nraf = 0;
 
-    if (FORZAR_BARRIDO) { tablas_barrido(t); return; }
-
+    /* Pasada 1: histograma (clasificacion exacta sobre 256 scans). */
     if (s_hist && s_hist_fill >= WARMUP_SCANS) {
         for (int c = 0; c < NUM_CANALES; c++) {
             if (g_cuenta[c] >= SCAN_MUESTRAS) continue;
             int sat, pres, total;
             hist_stats(c, &sat, &pres, &total);
-            if (sat * 100 > total * SAT_FRAC_MAX)   continue;
-            if (pres * 100 < total * PRES_FRAC_MIN) continue;
+            if (sat * 100 > total * SAT_FRAC_MAX)   continue;  /* WiFi/fijo */
+            if (pres * 100 < total * PRES_FRAC_MIN) continue;  /* ruido */
             insertar(elig, rank, &ne, n_max, (uint8_t)(CH_LO + c),
                      (uint16_t)(pres * 4 + g_cuenta[c]));
         }
         if (ne > 0) g_sel = 1;
     }
 
+    /* Pasada 2: si el histograma no dio nada, ranking por score. */
     if (ne == 0) {
         for (int c = 0; c < NUM_CANALES; c++) {
             if (g_cuenta[c] >= SCAN_MUESTRAS) continue;
@@ -565,7 +539,7 @@ static void IRAM_ATTR recalcular(void) {
 /* ===================== hop ===================== */
 static inline IRAM_ATTR void hop(radio_t *r, int ridx) {
     if (!r->vivo) return;
-    if (ridx == g_scan_idx) return;
+    if (ridx == g_scan_idx) return;          /* radio prestado al scan */
     const tablas_t *t = __atomic_load_n(&g_tab, __ATOMIC_ACQUIRE);
     if (t->len[ridx] == 0) return;
 
@@ -576,20 +550,6 @@ static inline IRAM_ATTR void hop(radio_t *r, int ridx) {
     if (r->bang_ok) bang_write(r, CMD_W_REGISTER | NRF_RF_CH, ch);
     else            nrf_write_reg(r, NRF_RF_CH, ch);
     r->hops++;
-}
-
-/* ===================== escalera de dwell ===================== */
-static inline IRAM_ATTR void escalon_subir(void) {
-    if (g_escalon + 1 < N_ESCALONES) {
-        g_escalon++;
-        g_dwell = k_dwell[g_escalon];
-    } else if (DWELL_LOOP) {
-        g_escalon = 0;
-        g_dwell = k_dwell[0];
-    } else {
-        return;
-    }
-    g_pulso_hasta = esp_timer_get_time() + 600000;
 }
 
 /* ===================== scan con VENTANA DE SILENCIO ===================== */
@@ -608,6 +568,7 @@ static inline void todos_ce_hi(void) {
     for (int i = 0; i < NUM_RADIOS; i++) if (radios[i].vivo) ce_hi(&radios[i]);
 }
 
+/* NO puede fallar: si no levanta el CE, la placa queda muda para siempre. */
 static void radio_devolver_tx(radio_t *r) {
     if (!r || !r->vivo) return;
     ce_lo(r);
@@ -620,13 +581,14 @@ static inline void scan_iniciar(void) {
     radio_t *r = scan_radio();
     if (!r) { scan_activo = false; g_scan_idx = -1; return; }
 
+    /* VENTANA DE SILENCIO: toda la placa a standby antes de medir nada. */
     todos_ce_lo();
     g_quiet = true;
 
     g_scan_idx = (int)(r - radios);
-    nrf_write_reg(r, NRF_RF_SETUP, RF_SETUP_MAX);
+    nrf_write_reg(r, NRF_RF_SETUP, RF_SETUP_MAX);   /* sin CONT_WAVE */
     nrf_write_reg(r, NRF_CONFIG, CONFIG_RX);
-    ce_hi(r);
+    ce_hi(r);                                        /* solo el escaner en RX */
 
     memset(g_cuenta, 0, sizeof(g_cuenta));
     scan_pasada = 0;
@@ -640,13 +602,15 @@ static inline void scan_paso(void) {
     radio_t *r = &radios[g_scan_idx];
     if (!r->vivo) { scan_activo = false; g_scan_idx = -1; return; }
     nrf_write_reg(r, NRF_RF_CH, (uint8_t)(CH_LO + scan_ch));
-    esp_rom_delay_us(200);
+    esp_rom_delay_us(200);              /* 130us sintetizador + 40us AGC */
     if (nrf_read_reg(r, NRF_RPD) & 0x01) g_cuenta[scan_ch]++;
 
     scan_ch++;
     if (scan_ch >= NUM_CANALES) { scan_ch = 0; scan_pasada++; }
 }
 
+/* PUNTO FIJO x256: el decremento existe para cualquier score. Con s/DEC entero
+ * un score < DEC NUNCA decaeria y el mapa no olvidaria nada. */
 static inline void score_actualizar(void) {
     for (int c = 0; c < NUM_CANALES; c++) {
         if (g_cuenta[c] >= SCAN_MUESTRAS) { g_score[c] = 0; continue; }
@@ -658,6 +622,8 @@ static inline void score_actualizar(void) {
 }
 
 static inline void scan_fin(void) {
+    /* TODOS los caminos de salida levantan los CE. Si no, la placa queda
+     * en silencio y el jammer muere sin avisar. */
     if (g_scan_idx >= 0 && g_scan_idx < NUM_RADIOS)
         radio_devolver_tx(&radios[g_scan_idx]);
 
@@ -691,39 +657,21 @@ static void led_init(void) {
     led_set(0, 0, 60); vTaskDelay(pdMS_TO_TICKS(120));
     led_set(0, 0, 0);
 }
-
-static void led_hsv(uint8_t h, uint8_t s, uint8_t v) {
-    uint8_t reg = (uint8_t)(h / 43);
-    uint8_t rem = (uint8_t)((h - reg * 43) * 6);
-    uint8_t p = (uint8_t)((v * (255 - s)) >> 8);
-    uint8_t q = (uint8_t)((v * (255 - ((s * rem) >> 8))) >> 8);
-    uint8_t t = (uint8_t)((v * (255 - ((s * (255 - rem)) >> 8))) >> 8);
-    switch (reg) {
-        case 0:  led_set(v, t, p); break;
-        case 1:  led_set(q, v, p); break;
-        case 2:  led_set(p, v, t); break;
-        case 3:  led_set(p, q, v); break;
-        case 4:  led_set(t, p, v); break;
-        default: led_set(v, p, q); break;
-    }
-}
-
 static void led_update(void) {
-    static uint8_t hue = 0;
-
     if (g_vivos == 0) { led_set(LED_BRILLO, 0, 0); return; }
-    if (g_flash) { g_flash = false; led_set(LED_BRILLO, LED_BRILLO, LED_BRILLO); return; }
-
-    if (esp_timer_get_time() < g_pulso_hasta) {
-        hue = (uint8_t)(hue + 48);
-        led_hsv(hue, 255, LED_BRILLO);
+    if (g_flash)   { g_flash = false; led_set(LED_BRILLO, LED_BRILLO, LED_BRILLO); return; }
+    int64_t t = esp_timer_get_time();
+    if (g_cazando) {                       /* CAZA: verde pulsante */
+        int fase = (int)((t % 1500000) * 2 / 1500000);
+        led_set(0, LED_BRILLO, (uint8_t)(LED_BRILLO / 3 * fase));
         return;
     }
-
-    uint8_t v = (g_vivos < NUM_RADIOS) ? (uint8_t)(LED_BRILLO / 3)
-                                       : (uint8_t)(LED_BRILLO / 2);
-    hue = (uint8_t)(hue + 2);
-    led_hsv(hue, 255, v);
+    if (g_vivos < NUM_RADIOS) {            /* barrido degradado: ambar */
+        int fase = (int)((t % 3000000) * 2 / 3000000);
+        led_set((uint8_t)(LED_BRILLO * fase / 2), (uint8_t)(LED_BRILLO * fase / 3), 0);
+        return;
+    }
+    led_set(0, 0, LED_BRILLO);             /* barrido completo: azul */
 }
 
 /* ===================== tasks ===================== */
@@ -734,8 +682,8 @@ static void IRAM_ATTR jam_bus2(void *arg) {
         hop(&radios[0], 0);
         hop(&radios[1], 1);
         hop(&radios[2], 2);
+        /* wait anclado a c0 (antes de los hops): periodo exacto, sin drift */
         uint32_t d = g_dwell * CPU_MHZ;
-        d += rnd() % (d / 2);              /* +0..50% : rompe la periodicidad */
         while (cyc() - c0 < d) { }
         int64_t now = esp_timer_get_time();
         if (now - t_cede >= (int64_t)CEDE_MS * 1000) { t_cede = now; vTaskDelay(1); }
@@ -743,8 +691,7 @@ static void IRAM_ATTR jam_bus2(void *arg) {
 }
 
 static void IRAM_ATTR jam_bus3(void *arg) {
-    int64_t t_cede = esp_timer_get_time(), t_scan = esp_timer_get_time(),
-            t_led = t_cede, t_esc = t_cede;
+    int64_t t_cede = esp_timer_get_time(), t_scan = esp_timer_get_time(), t_led = t_cede;
     for (;;) {
         uint32_t c0 = cyc();
         hop(&radios[3], 3);
@@ -753,26 +700,25 @@ static void IRAM_ATTR jam_bus3(void *arg) {
 
         int64_t now = esp_timer_get_time();
 
-#if VENTANA_SCAN
         if (!scan_activo && !g_quiet && now - t_scan >= (int64_t)REESCANEO_MS * 1000) {
             t_scan = now;
             scan_iniciar();
         }
+
         if (scan_activo) {
             scan_paso();
+            /* solo corta en frontera de pasada: cortar a media pasada daba
+             * mas muestras a los canales bajos */
             if (scan_pasada >= SCAN_MUESTRAS ||
                 (scan_ch == 0 && (now - scan_t0) >= (int64_t)SCAN_HARD_MS * 1000)) {
                 scan_fin();
             }
         }
-#endif
 
         uint32_t d = g_dwell * CPU_MHZ;
-        d += rnd() % (d / 2);              /* +0..50% : rompe la periodicidad */
         while (cyc() - c0 < d) { }
 
         now = esp_timer_get_time();
-        if (now - t_esc >= (int64_t)ESCALON_MS * 1000) { t_esc = now; escalon_subir(); }
         if (now - t_led >= 64000) { t_led = now; led_update(); }
         if (now - t_cede >= (int64_t)CEDE_MS * 1000) { t_cede = now; vTaskDelay(1); }
     }
@@ -825,19 +771,18 @@ static void monitor_task(void *arg) {
         uint32_t cobertura = (t->n_total > 0) ? ((uint32_t)vivos * 100u / t->n_total) : 0;
         uint32_t perdida   = (g_ventana_us > 0) ? (g_ventana_us * 100u / ((uint32_t)REESCANEO_MS * 1000u)) : 0;
 
-        ESP_LOGI(TAG, "%s | obj=%d | L=%d | GAP=%luus | esc=%u/%d dwell=%lu",
-                 g_cazando ? "CAZA" : "BARRIDO", t->n_total, len_max,
-                 (unsigned long)gap, (unsigned)g_escalon, N_ESCALONES - 1,
-                 (unsigned long)g_dwell);
-        ESP_LOGI(TAG, "  ocup/canal=%lu%%  PLL_est=%lu%%  =>  ESTABLE=%lu%%  cobertura=%lu%%  ventana=%luus (-%lu%%)",
+        ESP_LOGI(TAG, "%s | obj=%d (rafaga=%d) | L=%d | GAP=%luus | scans=%d | ventana=%luus (-%lu%%) | sel=%s",
+                 g_cazando ? "CAZA" : "BARRIDO", t->n_total, t->n_rafaga,
+                 len_max, (unsigned long)gap, g_scans,
+                 (unsigned long)g_ventana_us, (unsigned long)(perdida > 100 ? 100 : perdida),
+                 g_sel == 1 ? "hist" : (g_sel == 2 ? "score" : "-"));
+        ESP_LOGI(TAG, "  ocup/canal=%lu%%  PLL_est=%lu%%  =>  ESTABLE=%lu%%  cobertura=%lu%%",
                  (unsigned long)ocup, (unsigned long)est, (unsigned long)estable,
-                 (unsigned long)cobertura, (unsigned long)g_ventana_us,
-                 (unsigned long)(perdida > 100 ? 100 : perdida));
-        ESP_LOGI(TAG, "  DH3(%uus):%s  DH5(%uus):%s  SPI=%dMHz vivos=%d scan=%s",
+                 (unsigned long)cobertura);
+        ESP_LOGI(TAG, "  DH3(%uus):%s  DH5(%uus):%s  dwell=%lu SPI=%dMHz vivos=%d",
                  (unsigned)PAQUETE_DH3, (gap < PAQUETE_DH3) ? "OK" : "NO",
                  (unsigned)PAQUETE_DH5, (gap < PAQUETE_DH5) ? "OK" : "NO",
-                 g_spi_hz / 1000000, vivos,
-                 (g_scan_idx >= 0) ? radios[g_scan_idx].nombre : "-");
+                 (unsigned long)g_dwell, g_spi_hz / 1000000, vivos);
 
         mapa_linea(mapa, sizeof(mapa));
         ESP_LOGI(TAG, "  MAPA[2..80] .=0 o<%d O<SAT #<64 @=denso:", SCORE_MIN);
@@ -845,7 +790,10 @@ static void monitor_task(void *arg) {
     }
 }
 
-/* ===================== piso de ruido propio ===================== */
+/* ===================== piso de ruido propio =====================
+ * Mide el PEOR CASO: co-canal con un transmisor. radio_add deja RF_CH=0x5A
+ * (canal 90, fuera de la banda BT) en los 6 radios, asi que hay que ponerlos
+ * en un canal conocido DENTRO de la banda antes de medir. */
 static void test_piso_ruido(void) {
     radio_t *r = NULL;
     for (int i = 5; i >= 3; i--) if (radios[i].vivo) { r = &radios[i]; break; }
@@ -861,7 +809,7 @@ static void test_piso_ruido(void) {
 
     int cocal[3] = {0,0,0}, lejos[3] = {0,0,0};
 
-    for (int p = 0; p < 3; p++) {
+    for (int p = 0; p < 3; p++) {                    /* con TX */
         ce_lo(r);
         nrf_write_reg(r, NRF_RF_SETUP, RF_SETUP_MAX);
         nrf_write_reg(r, NRF_CONFIG, CONFIG_RX);
@@ -871,6 +819,7 @@ static void test_piso_ruido(void) {
         if (nrf_read_reg(r, NRF_RPD) & 0x01) cocal[p] = 1;
     }
 
+    /* con todos en silencio */
     todos_ce_lo();
     for (int p = 0; p < 3; p++) {
         ce_lo(r);
@@ -899,6 +848,9 @@ static void test_piso_ruido(void) {
 void app_main(void) {
     led_init();
 
+    /* FIX v8.1: PRIMERO estacionar los 6 pares CS/CE, DESPUES los buses SPI.
+     * Si se inicializa un bus con los CS de los demas flotando, cualquier
+     * escritura colisiona en MISO y el readback falla. */
     park_all_pins();
 
     bus_init(SPI2_HOST, GPIO_NUM_12, GPIO_NUM_11, GPIO_NUM_13);
@@ -926,8 +878,6 @@ void app_main(void) {
 
     g_jam_ok = (activos > 0);
     g_vivos = activos;
-    g_dwell = k_dwell[0];
-    g_escalon = 0;
 
     hist_init();
     test_piso_ruido();
@@ -936,13 +886,14 @@ void app_main(void) {
     xTaskCreatePinnedToCore(jam_bus3, "bus3", 4096, NULL, configMAX_PRIORITIES - 1, NULL, 0);
     xTaskCreatePinnedToCore(monitor_task, "mon", 3072, NULL, 1, NULL, 0);
 
-    ESP_LOGI(TAG, "CAZADOR v9.1 · %d/6 radios · BARRIDO BARAJADO 79 canales · 2 Mbps 0 dBm",
-             activos);
-    ESP_LOGI(TAG, "Escalera dwell: %u -> %u us en %d pasos de %u ms%s",
-             (unsigned)k_dwell[0], (unsigned)k_dwell[N_ESCALONES - 1],
-             N_ESCALONES - 1, (unsigned)ESCALON_MS, DWELL_LOOP ? " (en loop)" : "");
-    ESP_LOGI(TAG, "Barajado Fisher-Yates + jitter dwell +0..50%% · VENTANA_SCAN=%d · FORZAR_BARRIDO=%d",
-             VENTANA_SCAN, FORZAR_BARRIDO);
-    ESP_LOGI(TAG, "Arcoiris lento = barriendo · pulso = cambio de dwell · rojo = sin radios");
+    ESP_LOGI(TAG, "CAZADOR v8.2 · %d/6 radios · dwell=%uus · N_max=%d · SPI=%dMHz",
+             activos, (unsigned)DWELL_US, N_MAX, g_spi_hz / 1000000);
+    ESP_LOGI(TAG, "Arranca en BARRIDO. La caza tarda ~20-25 s en converger.");
+    ESP_LOGI(TAG, "BT~%.1f · ruido~%.1f · WiFi~%.1f | SCORE_MIN=%d SAT_MIN=%d",
+             (double)SCORE_DEC * SCAN_MUESTRAS * 0.05,
+             (double)SCORE_DEC * SCAN_MUESTRAS * 0.01,
+             (double)SCORE_DEC * SCAN_MUESTRAS * 0.85,
+             SCORE_MIN, SAT_MIN);
+    ESP_LOGI(TAG, "Verde = cazando · Azul = barrido · Blanco = recalculo");
     vTaskDelay(portMAX_DELAY);
 }
