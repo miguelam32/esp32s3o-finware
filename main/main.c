@@ -62,7 +62,7 @@ static const char *TAG = "CAZA";
 #define NUM_CANALES  (CH_HI - CH_LO + 1)      /* 79 */
 #define NUM_RADIOS   6
 
-#define DWELL_US     220u        /* > 130us: PLL engancha, potencia plena */
+#define DWELL_US     320u        /* > 130us: PLL engancha, potencia plena */
 
 #define PAQUETE_DH3  1622u       /* duracion real de paquete DH3 */
 #define PAQUETE_DH5  2870u       /* duracion real de paquete DH5 (BR) */
@@ -161,6 +161,7 @@ static int64_t  scan_t0 = 0;
 static int      scan_radio_idx = 5;
 static volatile int g_scan_idx = -1;
 static volatile uint32_t g_ventana_us = 0;
+static volatile uint8_t  g_sel = 0;   /* 0=barrido 1=hist 2=score */
 
 /* ===================== radios ===================== */
 typedef struct {
@@ -437,6 +438,7 @@ static void IRAM_ATTR tablas_barrido(tablas_t *t) {
     t->n_total = NUM_CANALES;
     t->n_rafaga = 0;
     g_cazando = false;
+    g_sel = 0;
 }
 
 static inline void insertar(uint8_t *elig, uint16_t *rank, int *ne, int n,
@@ -464,22 +466,36 @@ static void IRAM_ATTR tablas_caza(tablas_t *t, int n_max) {
     uint16_t rank[MAX_TAB];
     int ne = 0, nraf = 0;
 
-    for (int c = 0; c < NUM_CANALES; c++) {
-        if (g_cuenta[c] >= SCAN_MUESTRAS) continue;      /* saturado este scan */
-        uint16_t rk;
-        if (s_hist && s_hist_fill >= WARMUP_SCANS) {
+    /* Pasada 1: histograma (clasificacion exacta sobre 256 scans).
+     * En un entorno ruidoso la LNA del PA/LNA hace que el escaner oiga TODA la
+     * banda: casi todos los canales salen "saturados" y el histograma rechaza
+     * los 79 -> ne==0 -> BARRIDO para siempre. Eso es lo que paso en v8.1. */
+    if (s_hist && s_hist_fill >= WARMUP_SCANS) {
+        for (int c = 0; c < NUM_CANALES; c++) {
+            if (g_cuenta[c] >= SCAN_MUESTRAS) continue;
             int sat, pres, total;
             hist_stats(c, &sat, &pres, &total);
-            if (sat * 100 > total * SAT_FRAC_MAX)   continue;  /* WiFi/fijo */
-            if (pres * 100 < total * PRES_FRAC_MIN) continue;  /* ruido */
-            rk = (uint16_t)(pres * 4 + g_cuenta[c]);
-        } else {
+            if (sat * 100 > total * SAT_FRAC_MAX)   continue;
+            if (pres * 100 < total * PRES_FRAC_MIN) continue;
+            insertar(elig, rank, &ne, n_max, (uint8_t)(CH_LO + c),
+                     (uint16_t)(pres * 4 + g_cuenta[c]));
+        }
+        if (ne > 0) g_sel = 1;
+    }
+
+    /* Pasada 2: si el histograma no dio nada, ranking por score.
+     * El piconet siempre tiene MAS presencia que el ruido de fondo, aunque
+     * todo el mapa este sucio. Rankear toma los mejores N sin importar umbral. */
+    if (ne == 0) {
+        for (int c = 0; c < NUM_CANALES; c++) {
+            if (g_cuenta[c] >= SCAN_MUESTRAS) continue;
             uint32_t sc = g_score[c] >> SCORE_SHIFT;
             if (sc < SCORE_MIN) continue;
             if (sc >= SAT_MIN) continue;
-            rk = (uint16_t)((g_score[c] >> 4) + g_cuenta[c]);
+            insertar(elig, rank, &ne, n_max, (uint8_t)(CH_LO + c),
+                     (uint16_t)((g_score[c] >> 4) + g_cuenta[c]));
         }
-        insertar(elig, rank, &ne, n_max, (uint8_t)(CH_LO + c), rk);
+        if (ne > 0) g_sel = 2;
     }
     nraf = ne;
 
@@ -742,10 +758,11 @@ static void monitor_task(void *arg) {
         uint32_t cobertura = (t->n_total > 0) ? ((uint32_t)vivos * 100u / t->n_total) : 0;
         uint32_t perdida   = (g_ventana_us > 0) ? (g_ventana_us * 100u / ((uint32_t)REESCANEO_MS * 1000u)) : 0;
 
-        ESP_LOGI(TAG, "%s | obj=%d (rafaga=%d) | L=%d | GAP=%luus | scans=%d | ventana=%luus (-%lu%%)",
+        ESP_LOGI(TAG, "%s | obj=%d (rafaga=%d) | L=%d | GAP=%luus | scans=%d | ventana=%luus (-%lu%%) | sel=%s",
                  g_cazando ? "CAZA" : "BARRIDO", t->n_total, t->n_rafaga,
                  len_max, (unsigned long)gap, g_scans,
-                 (unsigned long)g_ventana_us, (unsigned long)(perdida > 100 ? 100 : perdida));
+                 (unsigned long)g_ventana_us, (unsigned long)(perdida > 100 ? 100 : perdida),
+                 g_sel == 1 ? "hist" : (g_sel == 2 ? "score" : "-"));
         ESP_LOGI(TAG, "  ocup/canal=%lu%%  PLL_est=%lu%%  =>  ESTABLE=%lu%%  cobertura=%lu%%",
                  (unsigned long)ocup, (unsigned long)est, (unsigned long)estable,
                  (unsigned long)cobertura);
