@@ -1,51 +1,54 @@
 /*
- * main.c — CAZADOR v8.2 — 6x nRF24L01+ PA/LNA — ESP32-S3 N16R8 — ESP-IDF v6.0.3
+ * main.c — CAZADOR v8.3 — 6x nRF24L01+ PA/LNA — ESP32-S3 N16R8 — ESP-IDF v6.0.3
  *
  * SPI2 (SCK 12, MOSI 11, MISO 13): NRF1(CE 4 CS 10) NRF2(CE 5 CS 9)  NRF3(CE 6 CS 14)
  * SPI3 (SCK 18, MOSI 8,  MISO 7):  NRF4(CE 1 CS 21) NRF5(CE 15 CS 16) NRF6(CE 17 CS 38)
  * WS2812 en GPIO 48.
  *
- * ====== FIX v8.2: DWELL_MIN_US ERA UN VLA ======
- * La v9.1 definia  #define DWELL_MIN_US k_dwell[0]  y de ahi salian L_MAX,
- * N_MAX y MAX_TAB. En C, k_dwell[0] NO es una expresion constante: es un
- * elemento de array. Las macros dejaban de ser constantes y
- *     uint8_t ch[NUM_RADIOS][MAX_TAB];
- * se volvia un VLA a nivel de archivo -> ilegal. GCC lo reportaba como
- * "variably modified 'ch' at file scope" en la linea del struct, 30 lineas
- * despues de la causa real.
- * Ahora DWELL_MIN_US es una constante literal y un _Static_assert lo ata a
- * k_dwell[0] para que no se desincronicen.
+ * ====== v8.3: LOS 6 ESCUCHAN A LA VEZ ======
+ * v8.2 prestaba UN radio al escaneo y los otros 5 seguian martillando. El
+ * barrido era serial: 79 canales x 3 pasadas con el lazo anclado al dwell
+ * (320us) -> 76 ms de ventana de silencio cada 1.2 s = 6.3% del duty perdido.
  *
- * ====== QUE MANTIENE DE v8.1 (QUE YA FUNCIONO) ======
+ * Pero esa ventana no es gratis: en 76 ms el piconet da ~122 saltos y
+ * RETRANSMITE todo lo que el jammer le acaba de matar. Es una ventana de
+ * recuperacion que se le regala.
+ *
+ * v8.3 pone LOS SEIS radios en RX simultaneo, cada uno en un canal distinto:
+ *     79 canales / 6 radios = 14 rondas x 3 pasadas = 42 rondas x ~380us
+ *                             ~= 16 ms   (antes: 76 ms)
+ *     duty perdido: 6.3% -> 1.4%
+ *
+ * Ademas el mapa pasa a ser una INSTANTANEA de los 79 canales tomada en el
+ * mismo instante, en vez de un barrido de 76 ms donde el piconet ya se movio.
+ *
+ * El precio: durante esos 16 ms nadie martilla. Por eso la ventana tiene que
+ * ser corta, y por eso hace falta el handshake g_pausa/g_ack: jam_bus3 no puede
+ * tocar el SPI de los 6 radios mientras jam_bus2 este hop-eando en ellos.
+ *
+ * ====== QUE MANTIENE DE v8.1/v8.2 ======
  * - park_all_pins() ANTES de cualquier transaccion SPI: con un CS flotando en
  *   bajo, su nRF drivea MISO y colisiona el bus -> falso "NO RESPONDE".
- *   Con este fix los 6 radios subieron.
  * - radio_init() con 5 reintentos y esperas de 100ms + LIBERACION del device
  *   en cada fallo (el IDF v6.0.3 reserva un slot de CS por dispositivo y hay
  *   3 por bus).
- * - VENTANA DE SILENCIO: el escaner esta a centimetros de 5 TX de +18 dBm.
- *   Sin bajar los CE, el mapa sale todo saturado -> BARRIDO para siempre.
+ * - VENTANA DE SILENCIO: el escaner esta a centimetros de transmisores de
+ *   +18 dBm. Sin bajar los CE, el mapa sale todo saturado -> BARRIDO siempre.
  * - Score en punto fijo 1/256: con division entera y DEC=24, cualquier score
  *   entre 1 y 23 NUNCA decae. En 1/256 el decremento existe siempre.
- * - Doble buffer de tablas + atomic store: el monitor lee mientras los
- *   nucleos recalculan.
+ * - Doble buffer de tablas + atomic store.
+ * - Histograma en PSRAM (64 scans = 77 s) + fallback por score.
  *
- * ====== POR QUE DWELL FIJO 320 (no escalera) ======
- * El PLL del nRF24 tarda ~130us en enganchar. Por debajo, la portadora BARRE
- * (chirp) y la potencia se dispersa. Lo que importa es el tiempo de portadora
- * ESTABLE dentro de un paquete:
+ * ====== POR QUE DWELL 320 ======
+ * El PLL tarda ~130us en enganchar. Por debajo la portadora BARRE (chirp).
  *     slots_estables = (T/dwell) * (dwell-130)/dwell
- *   dwell=170 -> 24% estable  ->  2.24 slots en un DH3
- *   dwell=320 -> 59% estable  ->  3.01 slots en un DH3
- *   dwell=260 -> 50% estable  ->  3.12 slots en un DH3  (optimo teorico)
- * 320us queda por encima del optimo por el margen de seguridad del GAP:
- * con L=4 y d=320 el gap es 960us, que cubre el DH3 (1622us) con 662us.
- * La escalera 180->320 te hace perder el DH3:OK durante 24 de cada 30 segundos.
+ *   dwell=170 -> 24% estable -> 2.24 slots en un DH3
+ *   dwell=320 -> 59% estable -> 3.01 slots en un DH3
+ * Con L=4 y d=320 el gap es 960us, que cubre el DH3 (1622us) con 662us.
  *
  * ====== GEOMETRIA ======
- * gap = (L-1)*d, NO la revisita. Un paquete de duracion T cae en una ventana
- * de golpeo garantizada si T > gap. d=320 y GAP_MAX=1200 -> L=4, 24 canales,
- * gap 960us: cubre DH3 (1622) con 662us de margen.
+ * gap = (L-1)*d. Un paquete de duracion T cae en una ventana de golpeo
+ * garantizada si T > gap. d=320 y GAP_MAX=1200 -> L=4, 24 canales, gap 960us.
  */
 
 #include <stdio.h>
@@ -77,7 +80,6 @@ static const char *TAG = "CAZA";
 
 #define SCAN_MUESTRAS  3         /* pasadas completas por ventana */
 #define REESCANEO_MS   1200      /* cada cuanto se escanea */
-#define SCAN_HARD_MS   900       /* techo duro; solo corta en frontera de pasada */
 
 /* Score en 1/256 de unidad (punto fijo). Ver cabecera. */
 #define SCORE_SHIFT   8
@@ -154,23 +156,25 @@ static tablas_t *g_tab = &g_buf[0];
 /* ===================== estado del scan ===================== */
 static uint8_t  g_cuenta[NUM_CANALES];
 static uint16_t g_score[NUM_CANALES];     /* 1/256 de unidad */
-/* Historia de escaneos en PSRAM (8 MB disponibles). */
-#define HIST_SCANS   256                  /* ~5 min a 1.2 s por scan */
-#define SAT_FRAC_MAX 30                   /* >30% saturado = WiFi */
-#define PRES_FRAC_MIN 8                   /* <8% con rafaga = ruido */
+/* Historia de escaneos en PSRAM. 64 scans = 77 s: sigue a un piconet que
+ * migra (con 256 scans = 5 min el mapa quedaba obsoleto). */
+#define HIST_SCANS    64
+#define SAT_FRAC_MAX  30                   /* >30% saturado = WiFi */
+#define PRES_FRAC_MIN 8                    /* <8% con rafaga = ruido */
 static uint8_t  *s_hist = NULL;
 static uint16_t  s_hist_idx = 0;
 static uint16_t  s_hist_fill = 0;
 
-static int      scan_ch = 0;
-static uint8_t  scan_pasada = 0;
 static uint8_t  g_scans = 0;
-static bool     scan_activo = false;
-static int64_t  scan_t0 = 0;
-static int      scan_radio_idx = 5;
-static volatile int g_scan_idx = -1;
 static volatile uint32_t g_ventana_us = 0;
 static volatile uint8_t  g_sel = 0;   /* 0=barrido 1=hist 2=score */
+static volatile uint8_t  g_hold = 0;  /* scans aguantando la ultima lista */
+#define HOLD_MAX_SCANS  8               /* ~10 s de gracia antes de soltar */
+
+/* Handshake: jam_bus3 pide pausa, jam_bus2 confirma. Sin esto, los dos
+ * nucleos escriben el mismo periferico SPI y se corrompe la transaccion. */
+static volatile bool g_pausa  = false;
+static volatile bool g_ack    = false;
 
 /* ===================== radios ===================== */
 typedef struct {
@@ -394,7 +398,7 @@ static void bang_detectar(radio_t *r) {
     ESP_LOGW(TAG, "%s BANG NO, uso driver", r->nombre);
 }
 
-/* ===================== tablas ===================== */
+/* ===================== historial en PSRAM ===================== */
 static void hist_init(void) {
     s_hist = heap_caps_malloc((size_t)NUM_CANALES * HIST_SCANS, MALLOC_CAP_SPIRAM);
     if (!s_hist) {
@@ -427,6 +431,7 @@ static inline void hist_stats(int c, int *sat, int *pres, int *total) {
     }
 }
 
+/* ===================== tablas ===================== */
 static void IRAM_ATTR tablas_barrido(tablas_t *t) {
     int vivos = 0;
     for (int i = 0; i < NUM_RADIOS; i++) if (radios[i].vivo) vivos++;
@@ -448,6 +453,7 @@ static void IRAM_ATTR tablas_barrido(tablas_t *t) {
     t->n_rafaga = 0;
     g_cazando = false;
     g_sel = 0;
+    g_hold = 0;
 }
 
 static inline void insertar(uint8_t *elig, uint16_t *rank, int *ne, int n,
@@ -470,12 +476,12 @@ static inline void insertar(uint8_t *elig, uint16_t *rank, int *ne, int n,
     if (*ne < n) (*ne)++;
 }
 
-static void IRAM_ATTR tablas_caza(tablas_t *t, int n_max) {
+static bool IRAM_ATTR tablas_caza(tablas_t *t, int n_max) {
     uint8_t  elig[MAX_TAB];
     uint16_t rank[MAX_TAB];
     int ne = 0, nraf = 0;
 
-    /* Pasada 1: histograma (clasificacion exacta sobre 256 scans). */
+    /* Pasada 1: histograma (clasificacion exacta sobre 64 scans). */
     if (s_hist && s_hist_fill >= WARMUP_SCANS) {
         for (int c = 0; c < NUM_CANALES; c++) {
             if (g_cuenta[c] >= SCAN_MUESTRAS) continue;
@@ -503,14 +509,28 @@ static void IRAM_ATTR tablas_caza(tablas_t *t, int n_max) {
     }
     nraf = ne;
 
-    if (ne == 0 || g_scans < WARMUP_SCANS) { tablas_barrido(t); return; }
+    /* La lista se vacio. Si teniamos una lista buena, la AGUANTAMOS: caer a
+     * BARRIDO completo sube el GAP de 960 a 4160us y le da al piconet ~2.5 s
+     * libres para reestablecerse. El verde->azul que veias era esto. */
+    if (ne == 0) {
+        if (g_cazando && g_hold < HOLD_MAX_SCANS) {
+            g_hold++;
+            return false;               /* hold: NO publicar */
+        }
+        g_hold = 0;
+        tablas_barrido(t);
+        return true;
+    }
+    g_hold = 0;
+
+    if (g_scans < WARMUP_SCANS) { tablas_barrido(t); return true; }
 
     int vivos[NUM_RADIOS], nv = 0;
     for (int i = 0; i < NUM_RADIOS; i++) {
         t->len[i] = 0;
         if (radios[i].vivo) vivos[nv++] = i;
     }
-    if (nv == 0) { tablas_barrido(t); return; }
+    if (nv == 0) { tablas_barrido(t); return true; }
 
     for (int k = 0; k < ne; k++) {
         int r = vivos[k % nv];
@@ -524,6 +544,7 @@ static void IRAM_ATTR tablas_caza(tablas_t *t, int n_max) {
     t->n_total = (uint8_t)ne;
     t->n_rafaga = (uint8_t)nraf;
     g_cazando = true;
+    return true;
 }
 
 static void IRAM_ATTR recalcular(void) {
@@ -532,14 +553,13 @@ static void IRAM_ATTR recalcular(void) {
     if (n_max < 1) n_max = 1;
     if ((uint32_t)n_max > (uint32_t)MAX_TAB) n_max = MAX_TAB;
 
-    tablas_caza(nueva, n_max);
-    __atomic_store_n(&g_tab, nueva, __ATOMIC_RELEASE);
+    if (tablas_caza(nueva, n_max))
+        __atomic_store_n(&g_tab, nueva, __ATOMIC_RELEASE);
 }
 
 /* ===================== hop ===================== */
 static inline IRAM_ATTR void hop(radio_t *r, int ridx) {
     if (!r->vivo) return;
-    if (ridx == g_scan_idx) return;          /* radio prestado al scan */
     const tablas_t *t = __atomic_load_n(&g_tab, __ATOMIC_ACQUIRE);
     if (t->len[ridx] == 0) return;
 
@@ -552,61 +572,87 @@ static inline IRAM_ATTR void hop(radio_t *r, int ridx) {
     r->hops++;
 }
 
-/* ===================== scan con VENTANA DE SILENCIO ===================== */
-static radio_t *scan_radio(void) {
-    for (int k = 1; k <= 3; k++) {
-        int i = 3 + ((scan_radio_idx - 3 + k + 3) % 3);
-        if (radios[i].vivo) { scan_radio_idx = i; return &radios[i]; }
+/* ===================== scan: LOS 6 A LA VEZ =====================
+ * Transicion TX -> RX en dos pasadas: PRIMERO bajar el CE de los 6 (silencio
+ * total), DESPUES configurar RX. Si se hiciera radio por radio, el ultimo en
+ * cambiar seguiria en CW mientras el primero ya escucha. */
+static void scan_todos_a_rx(void) {
+    for (int i = 0; i < NUM_RADIOS; i++)
+        if (radios[i].vivo) ce_lo(&radios[i]);
+
+    for (int i = 0; i < NUM_RADIOS; i++) {
+        radio_t *r = &radios[i];
+        if (!r->vivo) continue;
+        nrf_write_reg(r, NRF_RF_SETUP, RF_SETUP_MAX);   /* sin CONT_WAVE */
+        nrf_write_reg(r, NRF_CONFIG, CONFIG_RX);
+        ce_hi(r);                                        /* escucha */
     }
-    return NULL;
 }
 
-static inline void todos_ce_lo(void) {
-    for (int i = 0; i < NUM_RADIOS; i++) if (radios[i].vivo) ce_lo(&radios[i]);
-}
-static inline void todos_ce_hi(void) {
-    for (int i = 0; i < NUM_RADIOS; i++) if (radios[i].vivo) ce_hi(&radios[i]);
-}
+static void scan_todos_a_tx(void) {
+    for (int i = 0; i < NUM_RADIOS; i++)
+        if (radios[i].vivo) ce_lo(&radios[i]);
 
-/* NO puede fallar: si no levanta el CE, la placa queda muda para siempre. */
-static void radio_devolver_tx(radio_t *r) {
-    if (!r || !r->vivo) return;
-    ce_lo(r);
-    nrf_write_reg(r, NRF_CONFIG, CONFIG_TX);
-    nrf_write_reg(r, NRF_RF_SETUP, RF_SETUP_CW);
-    ce_hi(r);
+    for (int i = 0; i < NUM_RADIOS; i++) {
+        radio_t *r = &radios[i];
+        if (!r->vivo) continue;
+        nrf_write_reg(r, NRF_CONFIG, CONFIG_TX);
+        nrf_write_reg(r, NRF_RF_SETUP, RF_SETUP_CW);
+        ce_hi(r);
+    }
 }
 
-static inline void scan_iniciar(void) {
-    radio_t *r = scan_radio();
-    if (!r) { scan_activo = false; g_scan_idx = -1; return; }
+/* Barrido completo con los 6 radios en paralelo. Bloqueante (~16 ms).
+ * Cada ronda cubre 6 canales (uno por radio vivo). 79 canales / 6 = 14 rondas,
+ * x SCAN_MUESTRAS pasadas = 42 rondas x ~380us ~= 16 ms.
+ * Antes (1 radio serial con el lazo anclado al dwell): 76 ms. */
+static void scan_completo(void) {
+    int64_t t0 = esp_timer_get_time();
 
-    /* VENTANA DE SILENCIO: toda la placa a standby antes de medir nada. */
-    todos_ce_lo();
-    g_quiet = true;
+    int vivos[NUM_RADIOS], nv = 0;
+    for (int i = 0; i < NUM_RADIOS; i++) if (radios[i].vivo) vivos[nv++] = i;
+    if (nv == 0) return;
 
-    g_scan_idx = (int)(r - radios);
-    nrf_write_reg(r, NRF_RF_SETUP, RF_SETUP_MAX);   /* sin CONT_WAVE */
-    nrf_write_reg(r, NRF_CONFIG, CONFIG_RX);
-    ce_hi(r);                                        /* solo el escaner en RX */
+    /* pedir la pausa al otro nucleo y esperar el ack: sin esto, jam_bus2
+     * sigue hop-eando los mismos registros SPI mientras configuramos RX */
+    g_pausa = true;
+    for (int g = 0; g < 200000 && !g_ack; g++) { }
 
+    scan_todos_a_rx();
     memset(g_cuenta, 0, sizeof(g_cuenta));
-    scan_pasada = 0;
-    scan_ch = 0;
-    scan_activo = true;
-    scan_t0 = esp_timer_get_time();
-}
 
-static inline void scan_paso(void) {
-    if (g_scan_idx < 0 || g_scan_idx >= NUM_RADIOS) { scan_activo = false; return; }
-    radio_t *r = &radios[g_scan_idx];
-    if (!r->vivo) { scan_activo = false; g_scan_idx = -1; return; }
-    nrf_write_reg(r, NRF_RF_CH, (uint8_t)(CH_LO + scan_ch));
-    esp_rom_delay_us(200);              /* 130us sintetizador + 40us AGC */
-    if (nrf_read_reg(r, NRF_RPD) & 0x01) g_cuenta[scan_ch]++;
+    for (int pasada = 0; pasada < SCAN_MUESTRAS; pasada++) {
+        for (int base = 0; base < NUM_CANALES; base += nv) {
+            /* sintonizar los nv radios en nv canales distintos */
+            for (int k = 0; k < nv; k++) {
+                int c = base + k;
+                if (c >= NUM_CANALES) break;
+                bang_write(&radios[vivos[k]], CMD_W_REGISTER | NRF_RF_CH,
+                           (uint8_t)(CH_LO + c));
+            }
+            esp_rom_delay_us(200);   /* 130us PLL + 40us AGC + margen */
+            /* leer el RPD de cada uno */
+            for (int k = 0; k < nv; k++) {
+                int c = base + k;
+                if (c >= NUM_CANALES) break;
+                if (nrf_read_reg(&radios[vivos[k]], NRF_RPD) & 0x01) g_cuenta[c]++;
+            }
+        }
+    }
 
-    scan_ch++;
-    if (scan_ch >= NUM_CANALES) { scan_ch = 0; scan_pasada++; }
+    scan_todos_a_tx();
+
+    g_ventana_us = (uint32_t)(esp_timer_get_time() - t0);
+
+    score_actualizar();
+    hist_push(g_cuenta);
+    if (g_scans < 255) g_scans++;
+
+    g_pausa = false;      /* soltar al otro nucleo */
+    g_quiet = false;
+
+    recalcular();
+    g_flash = true;
 }
 
 /* PUNTO FIJO x256: el decremento existe para cualquier score. Con s/DEC entero
@@ -621,24 +667,14 @@ static inline void score_actualizar(void) {
     }
 }
 
-static inline void scan_fin(void) {
-    /* TODOS los caminos de salida levantan los CE. Si no, la placa queda
-     * en silencio y el jammer muere sin avisar. */
-    if (g_scan_idx >= 0 && g_scan_idx < NUM_RADIOS)
-        radio_devolver_tx(&radios[g_scan_idx]);
-
-    score_actualizar();
-    hist_push(g_cuenta);
-    if (g_scans < 255) g_scans++;
-    g_scan_idx = -1;
-
-    todos_ce_hi();
-    g_quiet = false;
-    g_ventana_us = (uint32_t)(esp_timer_get_time() - scan_t0);
-
-    scan_activo = false;
-    recalcular();
-    g_flash = true;
+/* jam_bus2 llama esto cada iteracion: si jam_bus3 pidio pausa, se detiene
+ * y confirma. Asi los dos nucleos nunca tocan el mismo periferico SPI. */
+static inline IRAM_ATTR void pausa_check(void) {
+    if (g_pausa) {
+        g_ack = true;
+        while (g_pausa) { }
+        g_ack = false;
+    }
 }
 
 /* ===================== LED ===================== */
@@ -661,17 +697,17 @@ static void led_update(void) {
     if (g_vivos == 0) { led_set(LED_BRILLO, 0, 0); return; }
     if (g_flash)   { g_flash = false; led_set(LED_BRILLO, LED_BRILLO, LED_BRILLO); return; }
     int64_t t = esp_timer_get_time();
-    if (g_cazando) {                       /* CAZA: verde pulsante */
+    if (g_cazando) {
         int fase = (int)((t % 1500000) * 2 / 1500000);
         led_set(0, LED_BRILLO, (uint8_t)(LED_BRILLO / 3 * fase));
         return;
     }
-    if (g_vivos < NUM_RADIOS) {            /* barrido degradado: ambar */
+    if (g_vivos < NUM_RADIOS) {
         int fase = (int)((t % 3000000) * 2 / 3000000);
         led_set((uint8_t)(LED_BRILLO * fase / 2), (uint8_t)(LED_BRILLO * fase / 3), 0);
         return;
     }
-    led_set(0, 0, LED_BRILLO);             /* barrido completo: azul */
+    led_set(0, 0, LED_BRILLO);
 }
 
 /* ===================== tasks ===================== */
@@ -679,9 +715,12 @@ static void IRAM_ATTR jam_bus2(void *arg) {
     int64_t t_cede = esp_timer_get_time();
     for (;;) {
         uint32_t c0 = cyc();
-        hop(&radios[0], 0);
-        hop(&radios[1], 1);
-        hop(&radios[2], 2);
+        pausa_check();                       /* ceder el SPI si hay scan */
+        if (!g_quiet) {
+            hop(&radios[0], 0);
+            hop(&radios[1], 1);
+            hop(&radios[2], 2);
+        }
         /* wait anclado a c0 (antes de los hops): periodo exacto, sin drift */
         uint32_t d = g_dwell * CPU_MHZ;
         while (cyc() - c0 < d) { }
@@ -694,29 +733,24 @@ static void IRAM_ATTR jam_bus3(void *arg) {
     int64_t t_cede = esp_timer_get_time(), t_scan = esp_timer_get_time(), t_led = t_cede;
     for (;;) {
         uint32_t c0 = cyc();
-        hop(&radios[3], 3);
-        hop(&radios[4], 4);
-        hop(&radios[5], 5);
+
+        if (!g_quiet) {
+            hop(&radios[3], 3);
+            hop(&radios[4], 4);
+            hop(&radios[5], 5);
+        }
 
         int64_t now = esp_timer_get_time();
 
-        if (!scan_activo && !g_quiet && now - t_scan >= (int64_t)REESCANEO_MS * 1000) {
+        if (!g_quiet && now - t_scan >= (int64_t)REESCANEO_MS * 1000) {
             t_scan = now;
-            scan_iniciar();
+            scan_completo();                 /* bloqueante ~16 ms */
         }
 
-        if (scan_activo) {
-            scan_paso();
-            /* solo corta en frontera de pasada: cortar a media pasada daba
-             * mas muestras a los canales bajos */
-            if (scan_pasada >= SCAN_MUESTRAS ||
-                (scan_ch == 0 && (now - scan_t0) >= (int64_t)SCAN_HARD_MS * 1000)) {
-                scan_fin();
-            }
+        if (!g_quiet) {
+            uint32_t d = g_dwell * CPU_MHZ;
+            while (cyc() - c0 < d) { }
         }
-
-        uint32_t d = g_dwell * CPU_MHZ;
-        while (cyc() - c0 < d) { }
 
         now = esp_timer_get_time();
         if (now - t_led >= 64000) { t_led = now; led_update(); }
@@ -771,11 +805,12 @@ static void monitor_task(void *arg) {
         uint32_t cobertura = (t->n_total > 0) ? ((uint32_t)vivos * 100u / t->n_total) : 0;
         uint32_t perdida   = (g_ventana_us > 0) ? (g_ventana_us * 100u / ((uint32_t)REESCANEO_MS * 1000u)) : 0;
 
-        ESP_LOGI(TAG, "%s | obj=%d (rafaga=%d) | L=%d | GAP=%luus | scans=%d | ventana=%luus (-%lu%%) | sel=%s",
+        ESP_LOGI(TAG, "%s | obj=%d (rafaga=%d) | L=%d | GAP=%luus | scans=%d | ventana=%luus (-%lu%%) | sel=%s%s",
                  g_cazando ? "CAZA" : "BARRIDO", t->n_total, t->n_rafaga,
                  len_max, (unsigned long)gap, g_scans,
                  (unsigned long)g_ventana_us, (unsigned long)(perdida > 100 ? 100 : perdida),
-                 g_sel == 1 ? "hist" : (g_sel == 2 ? "score" : "-"));
+                 g_sel == 1 ? "hist" : (g_sel == 2 ? "score" : "-"),
+                 g_hold ? " [HOLD]" : "");
         ESP_LOGI(TAG, "  ocup/canal=%lu%%  PLL_est=%lu%%  =>  ESTABLE=%lu%%  cobertura=%lu%%",
                  (unsigned long)ocup, (unsigned long)est, (unsigned long)estable,
                  (unsigned long)cobertura);
@@ -790,18 +825,16 @@ static void monitor_task(void *arg) {
     }
 }
 
-/* ===================== piso de ruido propio =====================
- * Mide el PEOR CASO: co-canal con un transmisor. radio_add deja RF_CH=0x5A
- * (canal 90, fuera de la banda BT) en los 6 radios, asi que hay que ponerlos
- * en un canal conocido DENTRO de la banda antes de medir. */
+/* ===================== piso de ruido propio ===================== */
 static void test_piso_ruido(void) {
     radio_t *r = NULL;
-    for (int i = 5; i >= 3; i--) if (radios[i].vivo) { r = &radios[i]; break; }
+    for (int i = 5; i >= 0; i--) if (radios[i].vivo) { r = &radios[i]; break; }
     if (!r) { ESP_LOGW(TAG, "PISO: sin radio disponible"); return; }
 
     const uint8_t CH = 40;
     const uint8_t probes[3] = { CH, CH + 2, CH + 20 };
 
+    /* los demas al mismo canal, en TX */
     for (int i = 0; i < NUM_RADIOS; i++) {
         if (!radios[i].vivo || &radios[i] == r) continue;
         nrf_write_reg(&radios[i], NRF_RF_CH, CH);
@@ -809,7 +842,8 @@ static void test_piso_ruido(void) {
 
     int cocal[3] = {0,0,0}, lejos[3] = {0,0,0};
 
-    for (int p = 0; p < 3; p++) {                    /* con TX */
+    /* con TX: mide el peor caso */
+    for (int p = 0; p < 3; p++) {
         ce_lo(r);
         nrf_write_reg(r, NRF_RF_SETUP, RF_SETUP_MAX);
         nrf_write_reg(r, NRF_CONFIG, CONFIG_RX);
@@ -819,8 +853,8 @@ static void test_piso_ruido(void) {
         if (nrf_read_reg(r, NRF_RPD) & 0x01) cocal[p] = 1;
     }
 
-    /* con todos en silencio */
-    todos_ce_lo();
+    /* en silencio total */
+    for (int i = 0; i < NUM_RADIOS; i++) if (radios[i].vivo) ce_lo(&radios[i]);
     for (int p = 0; p < 3; p++) {
         ce_lo(r);
         nrf_write_reg(r, NRF_RF_SETUP, RF_SETUP_MAX);
@@ -831,8 +865,11 @@ static void test_piso_ruido(void) {
         if (nrf_read_reg(r, NRF_RPD) & 0x01) lejos[p] = 1;
     }
 
-    radio_devolver_tx(r);
-    todos_ce_hi();
+    /* devolver el radio a TX */
+    ce_lo(r);
+    nrf_write_reg(r, NRF_CONFIG, CONFIG_TX);
+    nrf_write_reg(r, NRF_RF_SETUP, RF_SETUP_CW);
+    ce_hi(r);
 
     ESP_LOGI(TAG, "PISO (ch%d): co-canal TX=%d sil=%d | +2 TX=%d sil=%d | +20 TX=%d sil=%d",
              CH, cocal[0], lejos[0], cocal[1], lejos[1], cocal[2], lejos[2]);
@@ -886,14 +923,16 @@ void app_main(void) {
     xTaskCreatePinnedToCore(jam_bus3, "bus3", 4096, NULL, configMAX_PRIORITIES - 1, NULL, 0);
     xTaskCreatePinnedToCore(monitor_task, "mon", 3072, NULL, 1, NULL, 0);
 
-    ESP_LOGI(TAG, "CAZADOR v8.2 · %d/6 radios · dwell=%uus · N_max=%d · SPI=%dMHz",
+    ESP_LOGI(TAG, "CAZADOR v8.3 · %d/6 radios · dwell=%uus · N_max=%d · SPI=%dMHz",
              activos, (unsigned)DWELL_US, N_MAX, g_spi_hz / 1000000);
-    ESP_LOGI(TAG, "Arranca en BARRIDO. La caza tarda ~20-25 s en converger.");
-    ESP_LOGI(TAG, "BT~%.1f · ruido~%.1f · WiFi~%.1f | SCORE_MIN=%d SAT_MIN=%d",
+    ESP_LOGI(TAG, "Scan paralelo: 6 radios x %d rondas x %d pasadas ~= %luus (-1.4%% duty)",
+             (NUM_CANALES + activos - 1) / (activos ? activos : 1), SCAN_MUESTRAS,
+             (unsigned long)0);
+    ESP_LOGI(TAG, "BT~%.1f · ruido~%.1f · WiFi~%.1f | SCORE_MIN=%d SAT_MIN=%d | HOLD=%d",
              (double)SCORE_DEC * SCAN_MUESTRAS * 0.05,
              (double)SCORE_DEC * SCAN_MUESTRAS * 0.01,
              (double)SCORE_DEC * SCAN_MUESTRAS * 0.85,
-             SCORE_MIN, SAT_MIN);
+             SCORE_MIN, SAT_MIN, HOLD_MAX_SCANS);
     ESP_LOGI(TAG, "Verde = cazando · Azul = barrido · Blanco = recalculo");
     vTaskDelay(portMAX_DELAY);
 }
