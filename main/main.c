@@ -572,6 +572,18 @@ static inline IRAM_ATTR void hop(radio_t *r, int ridx) {
     r->hops++;
 }
 
+/* PUNTO FIJO x256: el decremento existe para cualquier score. Con s/DEC entero
+ * un score < DEC NUNCA decaeria y el mapa no olvidaria nada. */
+static inline void score_actualizar(void) {
+    for (int c = 0; c < NUM_CANALES; c++) {
+        if (g_cuenta[c] >= SCAN_MUESTRAS) { g_score[c] = 0; continue; }
+        uint32_t s = (uint32_t)g_score[c] + (uint32_t)g_cuenta[c] * SCORE_ONE;
+        s -= s / SCORE_DEC;
+        if (s > 0xFFFFu) s = 0xFFFFu;
+        g_score[c] = (uint16_t)s;
+    }
+}
+
 /* ===================== scan: LOS 6 A LA VEZ =====================
  * Transicion TX -> RX en dos pasadas: PRIMERO bajar el CE de los 6 (silencio
  * total), DESPUES configurar RX. Si se hiciera radio por radio, el ultimo en
@@ -655,17 +667,6 @@ static void scan_completo(void) {
     g_flash = true;
 }
 
-/* PUNTO FIJO x256: el decremento existe para cualquier score. Con s/DEC entero
- * un score < DEC NUNCA decaeria y el mapa no olvidaria nada. */
-static inline void score_actualizar(void) {
-    for (int c = 0; c < NUM_CANALES; c++) {
-        if (g_cuenta[c] >= SCAN_MUESTRAS) { g_score[c] = 0; continue; }
-        uint32_t s = (uint32_t)g_score[c] + (uint32_t)g_cuenta[c] * SCORE_ONE;
-        s -= s / SCORE_DEC;
-        if (s > 0xFFFFu) s = 0xFFFFu;
-        g_score[c] = (uint16_t)s;
-    }
-}
 
 /* jam_bus2 llama esto cada iteracion: si jam_bus3 pidio pausa, se detiene
  * y confirma. Asi los dos nucleos nunca tocan el mismo periferico SPI. */
